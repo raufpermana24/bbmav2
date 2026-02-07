@@ -5,6 +5,7 @@ from datetime import datetime
 import concurrent.futures
 import warnings
 
+# Filter warning agar log bersih
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==========================================
@@ -31,14 +32,15 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8361349338:AAHOlx4fKz_bp1MHnV
 # Contoh: '987654321'
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003768840240')
 
-# SETTING STRATEGI
-TIMEFRAME_SCAN = '15m'   # Cek Volume di 1 Jam
-VOLUME_THRESHOLD = 2.0  # Min. Volume harus 2x lipat dari rata-rata (200%)
-LIMIT = 100             
-TOP_COIN_COUNT = 300    
-MAX_THREADS = 10        
 
-OUTPUT_FOLDER = 'volume_bbma_results'
+# SETTING STRATEGI
+TIMEFRAME = '15m'       # Scan di Timeframe 15 Menit
+VOL_MULTIPLIER = 2.0    # Ambang Batas: Volume 2x (200%) dari rata-rata
+LIMIT = 200             # Ambil 200 candle (Agar cukup hitung rata-rata 96 candle ke belakang)
+TOP_COIN_COUNT = 300    # Scan 300 Koin
+MAX_THREADS = 10        # Kecepatan scan
+
+OUTPUT_FOLDER = 'volume_15m_results'
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 processed_signals = {} 
 
@@ -47,7 +49,7 @@ processed_signals = {}
 # ==========================================
 exchange = ccxt.binance({
     'apiKey': API_KEY, 'secret': API_SECRET,
-    'options': {'defaultType': 'future'},
+    'options': {'defaultType': 'spot'},
     'enableRateLimit': True, 
 })
 
@@ -58,21 +60,21 @@ def send_telegram_alert(symbol, data, image_path):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     
     icon = "🟢" if data['tipe'] == "BUY" else "🔴"
-    vol_percent = (data['vol_spike'] * 100) - 100
+    spike_pct = (data['spike_ratio'] * 100) - 100
     
     caption = (
-        f"📊 <b>VOLUME SPIKE + BBMA ALERT</b>\n"
+        f"🐋 <b>VOLUME SPIKE 15M ALERT</b>\n"
         f"💎 <b>{symbol}</b>\n"
         f"──────────────────────\n"
-        f"📈 <b>Vol. Spike:</b> {data['vol_spike']:.2f}x (Avg)\n"
-        f"🔥 <b>Lonjakan:</b> +{vol_percent:.0f}% !!\n"
+        f"📊 <b>Vol Spike:</b> {data['spike_ratio']:.2f}x (Avg 24H)\n"
+        f"🔥 <b>Lonjakan:</b> +{spike_pct:.0f}% !!\n"
         f"──────────────────────\n"
-        f"🛠 <b>Signal BBMA:</b> {data['signal']} {icon}\n"
+        f"🛠 <b>Setup BBMA:</b> {data['signal']} {icon}\n"
         f"🏷 <b>Tipe:</b> {data['tipe']}\n"
         f"💰 <b>Harga:</b> {data['price']}\n"
         f"📝 <b>Analisa:</b>\n{data['explanation']}\n"
         f"──────────────────────\n"
-        f"<i>Koin sedang trending/pump! 🚀</i>"
+        f"<i>Deteksi Paus Masuk (15m) ⚠️</i>"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
@@ -85,7 +87,7 @@ def send_telegram_alert(symbol, data, image_path):
 def generate_chart(df, symbol, signal_info):
     try:
         filename = f"{OUTPUT_FOLDER}/{symbol.replace('/','-')}_{signal_info['tipe']}.png"
-        plot_df = df.tail(60).set_index('timestamp')
+        plot_df = df.tail(80).set_index('timestamp') # Gambar 80 candle terakhir
         
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
         adds = [
@@ -95,11 +97,12 @@ def generate_chart(df, symbol, signal_info):
             mpf.make_addplot(plot_df['MA5_Hi'], color='cyan', width=0.6),
             mpf.make_addplot(plot_df['MA5_Lo'], color='magenta', width=0.6),
         ]
-        # Tambahkan indikator volume di chart
-        # mpf.make_addplot(plot_df['volume'], panel=1, color='white', type='bar', width=0.7),
+        
+        # Tambahkan Panel Volume
+        # mpf.make_addplot(plot_df['volume'], type='bar', panel=1, color='white', alpha=0.5, width=0.8),
 
         mpf.plot(plot_df, type='candle', style=style, addplot=adds, 
-                 title=f"{symbol} [1H Vol Spike {signal_info['vol_spike']:.1f}x]", 
+                 title=f"{symbol} [15M] - Vol Spike {signal_info['spike_ratio']:.1f}x", 
                  savefig=dict(fname=filename, bbox_inches='tight'), volume=True)
         return filename
     except: return None
@@ -116,9 +119,10 @@ def get_top_symbols(limit=300):
         return [t['symbol'] for t in sorted_tickers[:limit]]
     except: return []
 
-def fetch_ohlcv(symbol, timeframe):
+def fetch_ohlcv(symbol):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=LIMIT)
+        # Kita butuh LIMIT 200 agar bisa hitung rata-rata 96 candle ke belakang
+        bars = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
@@ -134,62 +138,69 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# 6. LOGIKA VOLUME SPIKE & BBMA
+# 6. LOGIKA VOLUME & BBMA
 # ==========================================
 
-def analyze_volume_spike(df):
+def analyze_volume_anomaly(df):
     """
-    Mengecek apakah volume candle terakhir meledak dibanding rata-rata
+    Mengecek apakah Volume 15M terakhir > 2x Rata-rata Volume 24H (96 candle terakhir)
     """
-    if df is None or len(df) < 25: return 0
+    if df is None or len(df) < 100: return 0
     
-    # Volume Candle Close Terakhir
+    # Volume Candle Close Terakhir (Indeks -2)
     current_vol = df['volume'].iloc[-2]
     
-    # Rata-rata volume 24 candle sebelumnya (24 Jam ke belakang)
-    avg_vol = df['volume'].iloc[-26:-2].mean()
+    # Rata-rata 96 candle sebelumnya (24 Jam x 4 candle/jam = 96)
+    # Kita ambil slice dari -98 sampai -2
+    avg_vol_24h = df['volume'].iloc[-98:-2].mean()
     
-    if avg_vol == 0: return 0
+    if avg_vol_24h == 0: return 0
     
-    # Rasio Spike (Misal: 2.5x rata-rata)
-    spike_ratio = current_vol / avg_vol
-    return spike_ratio
+    ratio = current_vol / avg_vol_24h
+    return ratio
 
 def analyze_bbma_setup(df):
     if df is None or len(df) < 55: return None
     c = df.iloc[-2] # Close Candle
     prev = df.iloc[-3]
-
+    
     ema_val = c.get('EMA_50', 0)
-    is_uptrend = c['close'] > ema_val
-    is_downtrend = c['close'] < ema_val
+    trend = "BULLISH" if c['close'] > ema_val else "BEARISH"
     
     signal_data = None
     tipe = "NONE"
 
     # --- SETUP BUY ---
-    if is_uptrend:
+    if trend == "BULLISH":
         tipe = "BUY"
+        # 1. Extreme Buy
         if c['MA5_Lo'] < c['BB_Low']:
-            signal_data = {"signal": "EXTREME", "explanation": "Volume Tinggi + Extreme Buy (Reversal)."}
+            signal_data = {"signal": "EXTREME", "explanation": "Volume Paus + Extreme Buy (Reversal)."}
+        # 2. Re-Entry Buy
         elif c['close'] > c['BB_Mid'] and c['low'] <= c['MA5_Lo']:
-            signal_data = {"signal": "RE-ENTRY", "explanation": "Volume Tinggi + Re-Entry Buy (Diskon)."}
+            signal_data = {"signal": "RE-ENTRY", "explanation": "Volume Paus + Re-Entry Buy (Diskon)."}
+        # 3. Momentum Buy
         elif c['close'] > c['BB_Up']:
-            signal_data = {"signal": "MOMENTUM", "explanation": "Volume Tinggi + Breakout Momentum."}
+            signal_data = {"signal": "MOMENTUM", "explanation": "Volume Paus + Breakout Kuat."}
+        # 4. CSA Buy
         elif prev['close'] < c['BB_Mid'] and c['close'] > c['BB_Mid']:
-            signal_data = {"signal": "CSA", "explanation": "Volume Tinggi + Break Mid BB."}
+            signal_data = {"signal": "CSA", "explanation": "Volume Paus + Break Mid BB."}
 
     # --- SETUP SELL ---
-    elif is_downtrend:
+    elif trend == "BEARISH":
         tipe = "SELL"
+        # 1. Extreme Sell
         if c['MA5_Hi'] > c['BB_Up']:
-            signal_data = {"signal": "EXTREME", "explanation": "Volume Tinggi + Extreme Sell."}
+            signal_data = {"signal": "EXTREME", "explanation": "Volume Paus + Extreme Sell."}
+        # 2. Re-Entry Sell
         elif c['close'] < c['BB_Mid'] and c['high'] >= c['MA5_Hi']:
-            signal_data = {"signal": "RE-ENTRY", "explanation": "Volume Tinggi + Re-Entry Sell."}
+            signal_data = {"signal": "RE-ENTRY", "explanation": "Volume Paus + Re-Entry Sell."}
+        # 3. Momentum Sell
         elif c['close'] < c['BB_Low']:
-            signal_data = {"signal": "MOMENTUM", "explanation": "Volume Tinggi + Breakdown Momentum."}
+            signal_data = {"signal": "MOMENTUM", "explanation": "Volume Paus + Breakdown Kuat."}
+        # 4. CSA Sell
         elif prev['close'] > c['BB_Mid'] and c['close'] < c['BB_Mid']:
-            signal_data = {"signal": "CSA", "explanation": "Volume Tinggi + Break Mid BB."}
+            signal_data = {"signal": "CSA", "explanation": "Volume Paus + Break Mid BB."}
 
     if signal_data:
         signal_data['tipe'] = tipe
@@ -204,24 +215,26 @@ def analyze_bbma_setup(df):
 # ==========================================
 def worker_scan(symbol):
     try:
-        # Ambil data 1 Jam
-        df = fetch_ohlcv(symbol, TIMEFRAME_SCAN)
+        # 1. Ambil Data 15M (Limit 200)
+        df = fetch_ohlcv(symbol)
         if df is None: return None
 
-        # 1. CEK VOLUME DULU (Filter Awal)
-        spike = analyze_volume_spike(df)
+        # 2. FILTER VOLUME (ANOMALI CHECK)
+        # Apakah volume 15 menit terakhir > 2x rata-rata 24 jam terakhir?
+        spike_ratio = analyze_volume_anomaly(df)
         
-        # Jika Volume TIDAK meledak, langsung skip (Hemat waktu)
-        if spike < VOLUME_THRESHOLD: 
-            return None 
+        # Jika Volume TIDAK meledak, langsung skip
+        if spike_ratio < VOL_MULTIPLIER:
+            return None
 
-        # 2. Jika Volume Bagus, baru CEK BBMA
+        # 3. CEK BBMA SETUP
+        # Jika Volume meledak, baru kita hitung indikator BBMA
         df = add_indicators(df)
         res = analyze_bbma_setup(df)
         
         if res:
             res['symbol'] = symbol
-            res['vol_spike'] = spike
+            res['spike_ratio'] = spike_ratio
             res['df'] = df
             return res
 
@@ -232,15 +245,15 @@ def worker_scan(symbol):
 # 8. MAIN LOOP
 # ==========================================
 def main():
-    print(f"=== VOLUME SPIKE + BBMA BOT ===")
-    print(f"Strategi: Cari koin dgn Volume {VOLUME_THRESHOLD}x rata-rata 24H -> Cek BBMA")
-    print(f"Timeframe: {TIMEFRAME_SCAN} | Target: {TOP_COIN_COUNT} Koin")
+    print(f"=== VOLUME HUNTER 15M + BBMA BOT ===")
+    print(f"Strategi: Volume Spike > {VOL_MULTIPLIER}x (vs Avg 24H) di TF 15M.")
+    print(f"Target: Top {TOP_COIN_COUNT} Koin.")
     
     global processed_signals
 
     while True:
         try:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan Volume & BBMA...")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan Volume 15M & BBMA...")
             symbols = get_top_symbols(TOP_COIN_COUNT)
             alerts_queue = []
             
@@ -259,24 +272,25 @@ def main():
                         sys.stdout.flush()
             
             duration = time.time() - start_t
-            print(f"\n✅ Selesai ({duration:.2f}s). Ditemukan: {len(alerts_queue)}")
+            print(f"\n✅ Selesai ({duration:.2f}s). Ditemukan: {len(alerts_queue)} Koin Hot.")
 
-            # Urutkan hasil berdasarkan lonjakan volume tertinggi
-            alerts_queue.sort(key=lambda x: x['vol_spike'], reverse=True)
+            # Urutkan berdasarkan lonjakan volume tertinggi
+            alerts_queue.sort(key=lambda x: x['spike_ratio'], reverse=True)
 
             for alert in alerts_queue:
                 sym = alert['symbol']
-                # Cek Memory
+                # Cek Memory berdasarkan waktu candle 15m
                 if processed_signals.get(sym) != alert['time']:
                     processed_signals[sym] = alert['time']
                     
-                    print(f"🔥 HOT: {sym} (Vol {alert['vol_spike']:.1f}x) -> {alert['signal']}")
+                    print(f"🔥 HOT: {sym} (Vol {alert['spike_ratio']:.1f}x) -> {alert['signal']}")
                     
                     img = generate_chart(alert['df'], sym, alert)
                     if img: send_telegram_alert(sym, alert, img)
             
-            print("⏳ Menunggu 1 menit...")
-            time.sleep(60)
+            # Scan 15 Menit bisa dilakukan lebih sering
+            print("⏳ Menunggu 30 detik...")
+            time.sleep(30)
 
         except KeyboardInterrupt: break
         except Exception as e:
