@@ -32,7 +32,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8361349338:AAHOlx4fKz_bp1MHnV
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003618941801')
 
 # SETTING STRATEGI
-TIMEFRAME_SCAN = '1h'   # Cek Volume di 1 Jam
+TIMEFRAME_SCAN = '4h'   # Cek Volume di 1 Jam
 VOLUME_THRESHOLD = 2.0  # Min. Volume harus 2x lipat dari rata-rata (200%)
 LIMIT = 100             
 TOP_COIN_COUNT = 300    
