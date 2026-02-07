@@ -47,7 +47,7 @@ processed_signals = {}
 # ==========================================
 exchange = ccxt.binance({
     'apiKey': API_KEY, 'secret': API_SECRET,
-    'options': {'defaultType': 'spot'},
+    'options': {'defaultType': 'furute'},
     'enableRateLimit': True, 
 })
 
