@@ -31,14 +31,16 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8361349338:AAHOlx4fKz_bp1MHnVg8CxS9MY_pcejxLes') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003559364460')
 
-# SETTING STRATEGI BARU (5 MENIT + VIRAL)
+
+
+# SETTING STRATEGI (TOP GAINER 5 MENIT)
 TIMEFRAME = '5m'        # Scalping Cepat
 VOL_MULTIPLIER = 2.0    # Volume minimal 2x rata-rata 
-LIMIT = 400             # Diperbanyak untuk cover 24 jam di 5m (288 candle)
-TOP_COIN_COUNT = 100    # Fokus ke 100 Koin Paling Viral/Naik
+LIMIT = 400             # Data candle
+TOP_COIN_COUNT = 100    # Fokus ke 100 Koin Kenaikan Tertinggi (Top Gainers)
 MAX_THREADS = 15        
 
-OUTPUT_FOLDER = 'viral_5m_results'
+OUTPUT_FOLDER = 'gainer_5m_results'
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 processed_signals = {} 
 
@@ -47,7 +49,7 @@ processed_signals = {}
 # ==========================================
 exchange = ccxt.binance({
     'apiKey': API_KEY, 'secret': API_SECRET,
-    'options': {'defaultType': 'future'},
+    'options': {'defaultType': 'spot'},
     'enableRateLimit': True, 
 })
 
@@ -64,11 +66,18 @@ def send_telegram_alert(symbol, data, image_path):
     pattern_txt = data.get('pattern', '-')
     smc_txt = data.get('smc_context', '-')
     
+    # Kategorisasi NATR
+    natr_val = data['natr']
+    volatility_status = "Rendah"
+    if natr_val > 0.5: volatility_status = "Sedang"
+    if natr_val > 1.0: volatility_status = "TINGGI ⚡"
+    
     caption = (
-        f"🚀 <b>VIRAL COIN ALERT (5M)</b>\n"
+        f"🚀 <b>TOP GAINER / VIRAL (5M)</b>\n"
         f"💎 <b>{symbol}</b>\n"
         f"📈 <b>24h Change:</b> +{data['24h_change']:.2f}%\n"
         f"──────────────────────\n"
+        f"⚡ <b>NATR (14):</b> {natr_val:.3f}% ({volatility_status})\n"
         f"📊 <b>Vol Spike:</b> {data['spike_ratio']:.2f}x\n"
         f"🛠 <b>Setup BBMA:</b> {data['signal']} {icon}\n"
         f"🧠 <b>SMC Vol:</b> {smc_txt}\n"
@@ -88,13 +97,11 @@ def send_telegram_alert(symbol, data, image_path):
 
 def generate_chart(df, symbol, signal_info):
     try:
-        smc_info = signal_info.get('smc_context', '')
         title_text = f"{symbol} [5M] - {signal_info['signal']}"
-        if "DIVERGENCE" in smc_info:
-            title_text += f" | SMC: {smc_info}"
+        title_text += f" | NATR: {signal_info['natr']:.2f}%"
 
         filename = f"{OUTPUT_FOLDER}/{symbol.replace('/','-')}_{signal_info['signal']}.png"
-        plot_df = df.tail(100).copy() # Zoom in untuk 5m
+        plot_df = df.tail(100).copy() 
         plot_df.set_index('timestamp', inplace=True)
         
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
@@ -118,12 +125,11 @@ def generate_chart(df, symbol, signal_info):
         return None
 
 # ==========================================
-# 5. DATA ENGINE (MODIFIED FOR VIRAL/RISING)
+# 5. DATA ENGINE (MODIFIED FOR TOP GAINERS)
 # ==========================================
 def get_viral_symbols(limit=100):
     """
-    Mengambil daftar koin yang sedang VIRAL (Top Gainers) dalam 24 jam terakhir.
-    Hanya mengambil pair USDT dengan volume minimal $2 Juta (untuk menghindari koin pump-dump low cap).
+    Mengambil daftar koin TOP GAINERS (Kenaikan Tertinggi) dalam 24 jam.
     """
     try:
         exchange.load_markets()
@@ -131,16 +137,12 @@ def get_viral_symbols(limit=100):
         valid_tickers = []
         
         for s, t in tickers.items():
-            # Filter hanya pair USDT, bukan token UP/DOWN/BEAR/BULL
             if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s and 'BEAR/' not in s and 'BULL/' not in s:
-                # Filter Volume > 2 Juta USD agar likuid
                 if t['quoteVolume'] and t['quoteVolume'] > 2000000:
                     valid_tickers.append(t)
         
-        # LOGIKA VIRAL: Urutkan berdasarkan % Kenaikan (percentage) Tertinggi
+        # LOGIKA GAINER: Urutkan berdasarkan % Kenaikan TERTINGGI (reverse=True)
         sorted_tickers = sorted(valid_tickers, key=lambda x: x['percentage'] if x['percentage'] else -999, reverse=True)
-        
-        # Ambil Top X koin
         return [{'symbol': t['symbol'], 'change': t['percentage']} for t in sorted_tickers[:limit]]
     except Exception as e: 
         print(f"Error fetch tickers: {e}")
@@ -148,7 +150,6 @@ def get_viral_symbols(limit=100):
 
 def fetch_ohlcv(symbol):
     try:
-        # Limit 400 untuk mengakomodasi rata-rata 24 jam pada timeframe 5m (288 bar)
         bars = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -156,49 +157,39 @@ def fetch_ohlcv(symbol):
     except: return None
 
 def add_indicators(df):
-    # Bollinger Bands
     bb = df.ta.bbands(length=20, std=2)
     df['BB_Up'] = bb.iloc[:, 2]
     df['BB_Mid'] = bb.iloc[:, 1]
     df['BB_Low'] = bb.iloc[:, 0]
     
-    # MA 5 & 10
     df['MA5_Hi'] = df['high'].rolling(5).mean()
     df['MA5_Lo'] = df['low'].rolling(5).mean()
     df['MA10_Hi'] = df['high'].rolling(10).mean()
     df['MA10_Lo'] = df['low'].rolling(10).mean()
-    
-    # EMA 50 untuk Trend
     df['EMA_50'] = df.ta.ema(length=50)
+    
+    # --- INDIKATOR NATR ---
+    df['NATR'] = df.ta.natr(length=14)
     
     return df
 
 # ==========================================
-# 6. LOGIKA ANALISIS (SMC, BBMA, PATTERN)
+# 6. LOGIKA ANALISIS
 # ==========================================
 
-# --- A. SMC VOLUME DIVERGENCE ---
 def analyze_smc_divergence(df):
     if df is None or len(df) < 30: return "Data Kurang"
-
-    # Ambil data 15 candle terakhir sebelum candle berjalan
     subset = df.iloc[-20:-2]
-    closes = subset['close'].values
-    volumes = subset['volume'].values
+    closes = subset['close'].values; volumes = subset['volume'].values
     x = np.arange(len(closes))
-    
     slope_price, _ = np.polyfit(x, closes, 1)
     slope_vol, _ = np.polyfit(x, volumes, 1)
-    price_threshold = closes[0] * 0.0001 # Sensitivitas lebih kecil utk 5m
-
+    price_threshold = closes[0] * 0.0001 
     result = "NORMAL"
-    if slope_price > price_threshold and slope_vol < 0:
-        result = "BEARISH DIVERGENCE (Weak Buyers)"
-    elif slope_price < -price_threshold and slope_vol < 0:
-        result = "BULLISH DIVERGENCE (Weak Sellers)"
+    if slope_price > price_threshold and slope_vol < 0: result = "BEARISH DIVERGENCE (Weak Buyers)"
+    elif slope_price < -price_threshold and slope_vol < 0: result = "BULLISH DIVERGENCE (Weak Sellers)"
     return result
 
-# --- B. CHART PATTERN ---
 def analyze_chart_pattern(df):
     if df is None or len(df) < 50: return None
     subset = df.iloc[-50:]
@@ -207,37 +198,26 @@ def analyze_chart_pattern(df):
     lows = subset['low'].values
     pattern_found = []
     
-    # Deteksi Double Top/Bottom (Simple Logic)
     peaks_idx = subset['high'].rolling(window=5, center=True).max() == subset['high']
     peaks = subset[peaks_idx]
-    troughs_idx = subset['low'].rolling(window=5, center=True).min() == subset['low']
-    troughs = subset[troughs_idx]
     
     if len(peaks) >= 2:
-        if abs(peaks.iloc[-1]['high'] - peaks.iloc[-2]['high']) / peaks.iloc[-2]['high'] < 0.003: # Toleransi 0.3%
+        if abs(peaks.iloc[-1]['high'] - peaks.iloc[-2]['high']) / peaks.iloc[-2]['high'] < 0.003:
              if (peaks.iloc[-1].name - peaks.iloc[-2].name) > 5:
-                 pattern_found.append("Double Top")
-    if len(troughs) >= 2:
-        if abs(troughs.iloc[-1]['low'] - troughs.iloc[-2]['low']) / troughs.iloc[-2]['low'] < 0.003:
-            if (troughs.iloc[-1].name - troughs.iloc[-2].name) > 5:
-                pattern_found.append("Double Bottom")
+                 pattern_found.append("Double Top (Reversal)")
 
-    # Deteksi Wedge
     y_high = highs[-20:]; y_low = lows[-20:]; x = np.arange(len(y_high))
     slope_high, _ = np.polyfit(x, y_high, 1)
     slope_low, _ = np.polyfit(x, y_low, 1)
     flat_threshold = 0.0003 * closes[-1] 
 
-    if slope_high < -flat_threshold and slope_low < 0 and slope_high < slope_low:
-        pattern_found.append("Falling Wedge")
-    elif slope_high > 0 and slope_low > flat_threshold and slope_low > slope_high:
-        pattern_found.append("Rising Wedge")
+    if slope_high > 0 and slope_low > flat_threshold and slope_low > slope_high:
+        pattern_found.append("Rising Wedge (Bearish)")
     elif (closes[-10] - closes[-30]) > 0 and abs(slope_high) < flat_threshold and abs(slope_low) < flat_threshold:
         pattern_found.append("Bullish Rectangle")
 
     return ", ".join(pattern_found) if pattern_found else None
 
-# --- C. BBMA OMA ALLY ---
 def analyze_bbma_setup(df):
     if df is None or len(df) < 30: return None
     c = df.iloc[-2]; prev = df.iloc[-3]
@@ -274,9 +254,7 @@ def analyze_bbma_setup(df):
 
 def analyze_volume_anomaly(df):
     if df is None or len(df) < 290: return 0
-    # Cek Volume candle terakhir (-2 karena -1 running)
     current_vol = df['volume'].iloc[-2]
-    # Rata-rata 24 jam terakhir (dalam 5 menit ada 288 candle)
     avg_vol_24h = df['volume'].iloc[-290:-2].mean()
     return current_vol / avg_vol_24h if avg_vol_24h > 0 else 0
 
@@ -291,24 +269,23 @@ def worker_scan(coin_data):
         df = fetch_ohlcv(symbol)
         if df is None: return None
 
-        # 1. Cek Volume Spike (Anomaly 5M)
         spike_ratio = analyze_volume_anomaly(df)
         if spike_ratio < VOL_MULTIPLIER:
             return None
 
         df = add_indicators(df)
-        
-        # 2. Cek BBMA Setup
+        natr_value = df['NATR'].iloc[-2]
+
         res = analyze_bbma_setup(df)
         
         if res:
-            # 3. Analisa SMC & Pattern
             smc_context = analyze_smc_divergence(df)
             pattern_data = analyze_chart_pattern(df)
             
             res['symbol'] = symbol
             res['24h_change'] = change_24h
             res['spike_ratio'] = spike_ratio
+            res['natr'] = natr_value
             res['df'] = df
             res['smc_context'] = smc_context
             res['pattern'] = pattern_data if pattern_data else "-"
@@ -321,17 +298,14 @@ def worker_scan(coin_data):
 # 8. MAIN LOOP
 # ==========================================
 def main():
-    print(f"🚀 BBMA + SMC + VIRAL COIN BOT (5M)")
-    print(f"Target: Top {TOP_COIN_COUNT} Koin (Highest 24h Change)")
-    print(f"Filter: 5M Volume Spike > {VOL_MULTIPLIER}x")
+    print(f"🚀 BBMA + SMC + GAINER + NATR BOT (5M)")
+    print(f"Target: Top {TOP_COIN_COUNT} Gainers | NATR(14) Volatility Check")
     
     global processed_signals
 
     while True:
         try:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Mengambil daftar koin VIRAL/NAIK...")
-            
-            # Ambil koin berdasarkan kenaikan tertinggi 24 jam (Viral)
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Mengambil daftar koin VIRAL/GAINER...")
             viral_coins = get_viral_symbols(TOP_COIN_COUNT)
             
             if not viral_coins:
@@ -339,14 +313,13 @@ def main():
                 time.sleep(10)
                 continue
                 
-            print(f"-> Memindai {len(viral_coins)} koin (Top Gainer: {viral_coins[0]['symbol']} +{viral_coins[0]['change']}%)")
+            print(f"-> Memindai {len(viral_coins)} koin Viral/Gainer...")
             
             alerts_queue = []
             completed = 0
             start_t = time.time()
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                # Pass object coin_data ke worker
                 futures = {executor.submit(worker_scan, coin): coin['symbol'] for coin in viral_coins}
                 
                 for future in concurrent.futures.as_completed(futures):
@@ -358,27 +331,24 @@ def main():
                         sys.stdout.flush()
             
             duration = time.time() - start_t
-            print(f"\n✅ Selesai ({duration:.1f}s). Ditemukan: {len(alerts_queue)} setup potensial.")
+            print(f"\n✅ Selesai ({duration:.1f}s). Ditemukan: {len(alerts_queue)} setup.")
 
-            # Prioritaskan signal dengan volume spike tertinggi
             alerts_queue.sort(key=lambda x: x['spike_ratio'], reverse=True)
 
             for alert in alerts_queue:
                 sym = alert['symbol']
                 sig_key = f"{sym}_{alert['signal']}"
                 
-                # Filter spam alert yang sama
                 if processed_signals.get(sig_key) != alert['time']:
                     processed_signals[sig_key] = alert['time']
                     
                     smc_tag = f"[SMC: {alert['smc_context']}]" if "DIVERGENCE" in alert['smc_context'] else ""
-                    print(f"🔥 {sym} (+{alert['24h_change']:.1f}%) -> {alert['signal']} {smc_tag}")
+                    print(f"🔥 {sym} (NATR: {alert['natr']:.2f}%) -> {alert['signal']} {smc_tag}")
                     
                     img = generate_chart(alert['df'], sym, alert)
                     if img: 
                         send_telegram_alert(sym, alert, img)
             
-            # 5M timeframe butuh scan lebih cepat
             print("⏳ Menunggu 20 detik...")
             time.sleep(20)
 
@@ -390,5 +360,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
