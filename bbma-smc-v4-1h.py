@@ -30,7 +30,6 @@ TELEGRAM_CHAT_ID = '-1003558146379'  # Contoh: '987654321'
 BINANCE_API_KEY = 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97'
 BINANCE_SECRET_KEY = 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB'
 
-
 # Pengaturan Scanner (Disesuaikan agar lebih hemat RAM)
 SCAN_INTERVAL = 30      # Interval diperlambat sedikit (30s) agar CPU adem
 COIN_LIMIT = 300        # Jumlah koin
@@ -217,7 +216,8 @@ def generate_chart(data):
         filename = f"{SCREENSHOT_DIR}/{symbol}_MTF.png"
         
         mc = mpf.make_marketcolors(up='#089981', down='#F23645', inherit=True)
-        s  = mpf.make_mpf_style(marketcolors=mc, style='nightclouds', gridstyle=':')
+        # PERBAIKAN: Ganti 'style' menjadi 'base_mpf_style'
+        s  = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', gridstyle=':')
         
         df = data['df'].tail(50).set_index(pd.DatetimeIndex(data['df'].tail(50)['time']))
         
@@ -329,6 +329,7 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"⚠️ Error Loop: {e}")
             time.sleep(10)
+
 
 
 
