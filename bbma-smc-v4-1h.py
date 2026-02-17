@@ -50,7 +50,7 @@ def get_exchange_instance():
         'apiKey': BINANCE_API_KEY,
         'secret': BINANCE_SECRET_KEY,
         'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
+        'options': {'defaultType': 'future'}
     })
 
 def fetch_deep_history(exchange, symbol, timeframe):
