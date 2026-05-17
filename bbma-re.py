@@ -67,8 +67,13 @@ TF_DURATION_SEC = {
 }
 
 TF_WEIGHT   = {'1h': 1, '4h': 2, '1d': 3, '1w': 4}
-MAX_THREADS = 20
+MAX_THREADS = 3            # ⚠️  Jangan naikkan — Binance mudah ban jika terlalu banyak
 MIN_VOLUME  = 1_000_000   # minimal quoteVolume $1 juta
+
+# ── Rate Limit & Ban handling ──────────────────────────────────
+REQUEST_DELAY   = 0.25    # detik jeda antar request (maks ~4 req/s)
+BAN_RETRY_DELAY = 120     # detik tunggu jika kena 418/429
+MAX_BAN_RETRIES = 5       # maksimal percobaan ulang saat ban
 
 # ── Direktori output ───────────────────────────────────────────
 DATA_DIR   = Path('bbma_data')          # simpan CSV OHLCV
@@ -100,12 +105,87 @@ SIGNAL_LABEL = {
 # ==========================================
 # 3. KONEKSI EXCHANGE — BINANCE FUTURES
 # ==========================================
+import threading as _threading
+
 exchange = ccxt.binance({
     'apiKey':    API_KEY,
     'secret':    API_SECRET,
-    'options':   {'defaultType': 'future'},   # USD-M Perpetual Futures
+    'options':   {'defaultType': 'future'},   # USD-M Futures
     'enableRateLimit': True,
+    'rateLimit': 300,   # ms antar request (ccxt internal limiter)
 })
+
+# ── Rate limiter terpusat — semua thread pakai satu antrian ───
+# Binance batas: ~1200 weight/menit untuk REST, kita sangat konservatif
+_api_lock         = _threading.Lock()   # satu request pada satu waktu
+_last_request_at  = 0.0                 # timestamp request terakhir
+_ban_until        = 0.0                 # timestamp kapan ban habis
+
+def _safe_api_call(fn, *args, **kwargs):
+    """
+    Wrapper aman untuk semua panggilan Binance API:
+    - Satu thread pada satu waktu (_api_lock)
+    - Jeda minimum REQUEST_DELAY antar request
+    - Deteksi 418/429 → tunggu BAN_RETRY_DELAY lalu retry
+    """
+    global _last_request_at, _ban_until
+
+    for attempt in range(MAX_BAN_RETRIES + 1):
+        # Jika masih dalam periode ban, tunggu dulu
+        with _api_lock:
+            now = time.time()
+            if now < _ban_until:
+                wait = _ban_until - now
+                print(f"  ⏸️  IP ban aktif — menunggu {wait:.0f}s sebelum retry...")
+            else:
+                wait = 0.0
+
+        if wait > 0:
+            time.sleep(wait + 1)
+
+        with _api_lock:
+            # Paksa jeda minimum antar request
+            elapsed = time.time() - _last_request_at
+            if elapsed < REQUEST_DELAY:
+                time.sleep(REQUEST_DELAY - elapsed)
+
+            try:
+                result = fn(*args, **kwargs)
+                _last_request_at = time.time()
+                return result
+
+            except ccxt.RateLimitExceeded as e:
+                _last_request_at = time.time()
+                # Coba ekstrak durasi ban dari pesan error Binance
+                msg = str(e)
+                ban_ts = _extract_ban_timestamp(msg)
+                if ban_ts:
+                    _ban_until = ban_ts / 1000.0
+                    wait_sec   = max(_ban_until - time.time(), BAN_RETRY_DELAY)
+                else:
+                    wait_sec   = BAN_RETRY_DELAY * (attempt + 1)
+                    _ban_until = time.time() + wait_sec
+
+                print(
+                    f"  🚫 Rate limit / IP ban (418/429) — "
+                    f"tunggu {wait_sec:.0f}s (percobaan {attempt+1}/{MAX_BAN_RETRIES})"
+                )
+
+            except Exception as e:
+                _last_request_at = time.time()
+                raise e   # error lain langsung lempar ke pemanggil
+
+        # Tunggu di luar lock agar thread lain tidak ikut diblokir
+        time.sleep(wait_sec)
+
+    return None   # semua percobaan habis
+
+
+def _extract_ban_timestamp(msg: str) -> int:
+    """Ekstrak timestamp milidetik dari pesan error Binance (jika ada)."""
+    import re
+    m = re.search(r'banned until (\d{13})', msg)
+    return int(m.group(1)) if m else 0
 
 # ==========================================
 # 4. STATE MANAGER (persist ke disk)
@@ -135,42 +215,56 @@ def save_state(state: dict):
 # 5. AMBIL SEMUA MARKET FUTURES
 # ==========================================
 def get_all_futures_symbols() -> list:
-    """Ambil semua pasang USDT futures aktif, urutkan berdasarkan volume."""
+    """
+    Ambil semua pasang USDT futures aktif via satu panggilan fetch_tickers.
+    Menggunakan _safe_api_call agar aman dari rate-limit / IP ban.
+    """
+    print("  📡 Mengambil semua market Binance Futures USDT...")
+
+    # load_markets hanya 1x — ccxt cache otomatis, tidak perlu panggil ulang
     try:
-        print("  📡 Mengambil semua market Binance Futures USDT...")
-        exchange.load_markets()
-        tickers = exchange.fetch_tickers()
-
-        valid = []
-        for s, t in tickers.items():
-            if not (s.endswith('/USDT') or s.endswith('/USDT:USDT')):
-                continue
-            if any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
-                continue
-            vol = t.get('quoteVolume') or 0
-            if vol < MIN_VOLUME:
-                continue
-            valid.append({
-                'symbol': t['symbol'],
-                'change': t.get('percentage') or 0.0,
-                'volume': vol,
-            })
-
-        valid.sort(key=lambda x: x['volume'], reverse=True)
-        print(f"  ✅ {len(valid)} pasang futures aktif (vol > ${MIN_VOLUME:,})")
-        return valid
-
+        _safe_api_call(exchange.load_markets)
     except Exception as e:
-        print(f"  [Market Error] {e}")
+        print(f"  [load_markets Error] {e}")
         return []
+
+    tickers = _safe_api_call(exchange.fetch_tickers)
+    if not tickers:
+        print("  [Market Error] fetch_tickers gagal atau kena ban.")
+        return []
+
+    valid = []
+    for s, t in tickers.items():
+        if not (s.endswith('/USDT') or s.endswith('/USDT:USDT')):
+            continue
+        if any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
+            continue
+        vol = t.get('quoteVolume') or 0
+        if vol < MIN_VOLUME:
+            continue
+        valid.append({
+            'symbol': t['symbol'],
+            'change': t.get('percentage') or 0.0,
+            'volume': vol,
+        })
+
+    valid.sort(key=lambda x: x['volume'], reverse=True)
+    print(f"  ✅ {len(valid)} pasang futures aktif (vol > ${MIN_VOLUME:,})")
+    return valid
 
 # ==========================================
 # 6. FETCH OHLCV & SIMPAN KE DISK
 # ==========================================
 def fetch_and_save_ohlcv(symbol: str, timeframe: str) -> 'pd.DataFrame | None':
-    """Ambil OHLCV dari Binance Futures, simpan CSV, kembalikan DataFrame."""
+    """
+    Ambil OHLCV dari Binance Futures via _safe_api_call (rate-limit aman),
+    simpan CSV, kembalikan DataFrame.
+    """
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=TF_LIMIT.get(timeframe, 200))
+        bars = _safe_api_call(
+            exchange.fetch_ohlcv, symbol, timeframe,
+            limit=TF_LIMIT.get(timeframe, 200)
+        )
         if not bars:
             return None
 
@@ -718,10 +812,14 @@ def tf_worker(tf: str, state: dict, stop_event: threading.Event):
 # 17. SYMBOL REFRESH DAEMON
 # ==========================================
 def symbol_refresh_daemon(state: dict, stop_event: threading.Event):
-    """Refresh daftar simbol tiap 1 jam di background thread."""
+    """
+    Refresh daftar simbol tiap 4 jam di background thread.
+    (lebih lama dari sebelumnya agar tidak sering panggil fetch_tickers)
+    """
+    REFRESH_INTERVAL = 4 * 3600   # 4 jam
     while not stop_event.is_set():
         now = time.time()
-        if now - state.get('last_market_fetch', 0) > 3600 or not _shared_symbols:
+        if now - state.get('last_market_fetch', 0) > REFRESH_INTERVAL or not _shared_symbols:
             symbols = get_all_futures_symbols()
             if symbols:
                 _set_symbols(symbols)
@@ -729,7 +827,9 @@ def symbol_refresh_daemon(state: dict, stop_event: threading.Event):
                     state['last_market_fetch'] = now
                     save_state(state)
             else:
-                print("  ⚠️  Gagal refresh market, akan retry...")
+                print("  ⚠️  Gagal refresh market, akan retry 5 menit lagi...")
+                time.sleep(300)
+                continue
         # Cek tiap 60 detik
         for _ in range(60):
             if stop_event.is_set():
