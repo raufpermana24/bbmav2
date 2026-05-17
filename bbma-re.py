@@ -29,7 +29,7 @@ API_KEY    = os.environ.get('BINANCE_API_KEY',    'fZwDMOfBL6rDU9jfUQox64fUAb2RS
 API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',   '8361349338:AAHOlx4fKz_bp1MHnVg8CxS9MY_pcejxLes')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003559364460')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003964469739')
 
 # ── Timeframe yang discan setiap siklus ─────────────────────
 TIMEFRAMES = ['1h', '4h', '1d', '1w']
@@ -69,7 +69,7 @@ last_scan_time: dict = {tf: 0.0 for tf in TIMEFRAMES}
 # ==========================================
 exchange = ccxt.binance({
     'apiKey': API_KEY, 'secret': API_SECRET,
-    'options': {'defaultType': 'spot'},
+    'options': {'defaultType': 'future'},
     'enableRateLimit': True,
 })
 
