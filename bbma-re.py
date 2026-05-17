@@ -96,8 +96,8 @@ DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
 # ── Missed signal scan saat startup ──────────────────────────
-# Hanya scan sinyal dalam 1 jam ke belakang dari waktu bot start
-MISSED_LOOKBACK_SECONDS = 86400  # 1 hari
+# Hanya scan sinyal dalam 8 jam ke belakang dari waktu bot start
+MISSED_LOOKBACK_SECONDS = 28800  # 8 jam
 # Jeda antar pengiriman sinyal terlewat (detik), hindari flood TG
 MISSED_SIGNAL_DELAY = 1.5
 
@@ -829,12 +829,12 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
 # ==========================================
 def scan_missed_signals(symbols: list):
     """
-    Scan candle-candle yang close-nya jatuh dalam 1 jam terakhir
+    Scan candle-candle yang close-nya jatuh dalam 8 jam terakhir
     (MISSED_LOOKBACK_SECONDS dari waktu bot start).
 
     Logika filter waktu:
       - Ambil timestamp close tiap candle dari data historis.
-      - Hanya proses candle yang close-nya >= (now - 1 jam).
+      - Hanya proses candle yang close-nya >= (now - 8 jam).
       - Candle running (candle terakhir, masih berjalan) dilewati.
 
     Sinyal yang ditemukan dikirim ke Telegram dengan label ⏪ MISSED,
@@ -846,7 +846,7 @@ def scan_missed_signals(symbols: list):
     cutoff_ts  = now_ts - pd.Timedelta(seconds=MISSED_LOOKBACK_SECONDS)
 
     print("\n" + "=" * 65)
-    print("  ⏪  SCANNING SINYAL 1 HARI TERAKHIR (Missed Signal Scan)...")
+    print("  ⏪  SCANNING SINYAL 8 JAM TERAKHIR (Missed Signal Scan)...")
     print(f"  Rentang  : {cutoff_ts.strftime('%Y-%m-%d %H:%M')} → sekarang")
     print("=" * 65)
 
@@ -869,9 +869,9 @@ def scan_missed_signals(symbols: list):
             # df.iloc[-2]  → closed terbaru   (idx=0 di compute_signals_at)
             # df.iloc[-3]  → closed sebelumnya (idx=1), dst.
             # Durasi satu candle dipakai untuk menentukan berapa candle
-            # yang perlu di-cek agar mencakup tepat 1 jam.
+            # yang perlu di-cek agar mencakup tepat 8 jam.
             dur_sec   = TF_DURATION_SEC[tf]
-            # Jumlah candle maksimal yang bisa menutup dalam 1 jam
+            # Jumlah candle maksimal yang bisa menutup dalam 8 jam
             max_back  = max(int(MISSED_LOOKBACK_SECONDS / dur_sec) + 1, 1)
 
             mtf = None   # lazy — hitung sekali hanya jika ada sinyal
@@ -888,7 +888,7 @@ def scan_missed_signals(symbols: list):
                 if hasattr(candle_ts, 'tzinfo') and candle_ts.tzinfo is not None:
                     candle_ts = candle_ts.tz_localize(None)
 
-                # Lewati candle di luar window 1 jam
+                # Lewati candle di luar window 8 jam
                 if candle_ts < cutoff_ts:
                     continue
 
@@ -926,7 +926,7 @@ def scan_missed_signals(symbols: list):
                         f"📐 <b>Multi-TF Bias:</b>\n{mtf_blk}\n"
                         f"──────────────────────\n"
                         f"📝 <b>Analisa :</b> {sig_data['explanation']}\n"
-                        f"⚠️  <i>Sinyal terlewat dalam 1 hari terakhir</i>\n"
+                        f"⚠️  <i>Sinyal terlewat dalam 8 jam terakhir</i>\n"
                         f"🕒 Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
 
@@ -937,18 +937,35 @@ def scan_missed_signals(symbols: list):
                         f"(candle: {candle_time})"
                     )
 
+                    # Generate chart BBMA (sama seperti sinyal live)
+                    img = generate_chart(df, sym, sig_name, tf)
+
                     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
                     try:
                         with _tg_lock:
-                            requests.post(
-                                f"{base}/sendMessage",
-                                data={
-                                    'chat_id':    TELEGRAM_CHAT_ID,
-                                    'text':       caption,
-                                    'parse_mode': 'HTML',
-                                },
-                                timeout=20,
-                            )
+                            if img and os.path.exists(img):
+                                with open(img, "rb") as photo:
+                                    requests.post(
+                                        f"{base}/sendPhoto",
+                                        data={
+                                            'chat_id':    TELEGRAM_CHAT_ID,
+                                            'caption':    caption,
+                                            'parse_mode': 'HTML',
+                                        },
+                                        files={'photo': photo},
+                                        timeout=30,
+                                    )
+                            else:
+                                # Fallback teks jika chart gagal dibuat
+                                requests.post(
+                                    f"{base}/sendMessage",
+                                    data={
+                                        'chat_id':    TELEGRAM_CHAT_ID,
+                                        'text':       caption,
+                                        'parse_mode': 'HTML',
+                                    },
+                                    timeout=20,
+                                )
                     except Exception as e:
                         print(f"  [TG Missed Error] {e}")
 
@@ -959,11 +976,11 @@ def scan_missed_signals(symbols: list):
         print(f"\n  ✅ Missed scan selesai — {total_missed} sinyal dikirim.")
         send_telegram_text(
             f"⏪ <b>Missed Signal Scan Selesai</b>\n"
-            f"Sinyal terlewat (1 hari terakhir): <b>{total_missed}</b>\n"
+            f"Sinyal terlewat (8 jam terakhir): <b>{total_missed}</b>\n"
             f"Bot kini masuk mode LIVE (WebSocket)."
         )
     else:
-        print("  ✅ Missed scan selesai — tidak ada sinyal dalam 1 jam terakhir.")
+        print("  ✅ Missed scan selesai — tidak ada sinyal dalam 8 jam terakhir.")
 
 # ==========================================
 # 16. WEBSOCKET — koneksi kline stream
