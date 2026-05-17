@@ -95,6 +95,12 @@ STATE_FILE = DATA_DIR / '_state.json'
 DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
+# ── Missed signal scan saat startup ──────────────────────────
+# Berapa candle terakhir yang di-scan untuk sinyal terlewatkan
+MISSED_SCAN_CANDLES = {'1h': 24, '4h': 12, '1d': 7, '1w': 4}
+# Jeda antar pengiriman sinyal terlewat (detik), hindari flood TG
+MISSED_SIGNAL_DELAY = 1.5
+
 # ── Label sinyal ──────────────────────────────────────────────
 ALLOWED_SIGNALS = {
     'REENTRY BUY', 'REENTRY SELL',
@@ -534,6 +540,83 @@ def compute_signals(df: pd.DataFrame) -> dict:
 
     return {k: v for k, v in signals.items() if k in ALLOWED_SIGNALS}
 
+
+def compute_signals_at(df: pd.DataFrame, idx: int) -> dict:
+    """
+    Hitung sinyal BBMA pada candle indeks `idx` (bukan hanya candle terakhir).
+    Dipakai saat scan sinyal terlewatkan saat startup.
+    `idx` adalah posisi candle yang sudah *close* (candle[-1] = candle running,
+    candle[-2] = closed terbaru, dst).
+    """
+    # Butuh minimal idx+2 baris (c = idx, prev = idx-1)
+    if df is None or len(df) < idx + 3:
+        return {}
+
+    c    = df.iloc[-(idx + 2)]   # candle closed yang di-scan
+    prev = df.iloc[-(idx + 3)]   # candle sebelumnya
+
+    csz_c    = abs(c['close']    - c['open'])
+    csz_prev = abs(prev['close'] - prev['open'])
+    signals  = {}
+
+    if (c['high'] > c['mahi5']
+            and c['close'] < c['mahi5']
+            and c['close'] < c['mahi10']
+            and c['close'] < c['midBB']
+            and c['mahi5'] < c['midBB']):
+        signals['REENTRY SELL'] = {
+            'tipe': 'SELL',
+            'explanation': 'Harga ditolak dari MAHI5 — potensi turun lanjut.',
+        }
+
+    if (c['low'] < c['malo5']
+            and c['close'] > c['malo5']
+            and c['close'] > c['malo10']
+            and c['close'] > c['midBB']
+            and c['malo5'] > c['midBB']):
+        signals['REENTRY BUY'] = {
+            'tipe': 'BUY',
+            'explanation': 'Harga ditolak dari MALO5 — potensi naik lanjut.',
+        }
+
+    if c['close'] < c['lowBB'] and c['open'] > c['lowBB']:
+        signals['MMT SELL'] = {
+            'tipe': 'SELL',
+            'explanation': 'Momentum — close menembus ke bawah LowBB (CSM Sell).',
+        }
+
+    if c['close'] > c['topBB'] and c['open'] < c['topBB']:
+        signals['MMT BUY'] = {
+            'tipe': 'BUY',
+            'explanation': 'Momentum — close menembus ke atas TopBB (CSM Buy).',
+        }
+
+    if (prev['close'] > prev['open']
+            and c['close'] < c['topBB']
+            and c['close'] < c['open']
+            and (c['mahi5_p'] > c['topBB_p'] or c['mahi5'] > c['topBB'])
+            and csz_c > csz_prev / 2):
+        signals['EXTREME SELL'] = {
+            'tipe': 'SELL',
+            'explanation': 'Engulfing bearish — MAHI5 di atas TopBB, reversal turun.',
+        }
+
+    if (prev['close'] < prev['open']
+            and c['close'] > c['lowBB']
+            and c['close'] > c['open']
+            and (c['malo5_p'] < c['lowBB_p'] or c['malo5'] < c['lowBB'])
+            and csz_c > csz_prev / 2):
+        signals['EXTREME BUY'] = {
+            'tipe': 'BUY',
+            'explanation': 'Engulfing bullish — MALO5 di bawah LowBB, reversal naik.',
+        }
+
+    for k in signals:
+        signals[k]['price'] = float(c['close'])
+        signals[k]['time']  = str(c['timestamp'])
+
+    return {k: v for k, v in signals.items() if k in ALLOWED_SIGNALS}
+
 # ==========================================
 # 12. MULTI-TIMEFRAME BIAS
 # ==========================================
@@ -740,6 +823,119 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
             data=sig_data, change_24h=change_24h,
             mtf=mtf, image_path=img,
         )
+
+# ==========================================
+# 15b. SCAN SINYAL TERLEWATKAN — dijalankan sekali saat startup
+# ==========================================
+def scan_missed_signals(symbols: list):
+    """
+    Scan candle-candle historis (N candle terakhir per TF) untuk menemukan
+    sinyal BBMA yang mungkin terlewat saat bot offline.
+    Sinyal yang ditemukan langsung dikirim ke Telegram dengan label ⏪ MISSED.
+    Setelah scan selesai, sinyal tersebut juga dicatat di _processed_signals
+    agar tidak dikirim ulang saat WebSocket mendeteksi candle yang sama.
+    """
+    global _processed_signals
+
+    print("\n" + "=" * 65)
+    print("  ⏪  SCANNING SINYAL TERLEWATKAN (Missed Signal Scan)...")
+    print("=" * 65)
+
+    total_missed = 0
+
+    for coin in symbols:
+        sym    = coin['symbol']
+        change = coin.get('change', 0.0)
+
+        for tf in TIMEFRAMES:
+            df_raw = store_get(sym, tf)
+            if not _is_data_complete(df_raw, tf):
+                continue
+
+            df = add_indicators(df_raw)
+            n_back = MISSED_SCAN_CANDLES.get(tf, 5)
+            mtf    = None   # lazy — hitung sekali hanya jika ada sinyal
+
+            # Scan dari candle paling lama ke paling baru
+            # idx=0 → candle closed terbaru (sama dgn on_candle_close)
+            # idx=1 → 1 candle sebelumnya, dst.
+            for idx in range(n_back - 1, -1, -1):
+                sigs = compute_signals_at(df, idx)
+                if not sigs:
+                    continue
+
+                if mtf is None:
+                    mtf = get_mtf_bias(sym)
+
+                for sig_name, sig_data in sigs.items():
+                    sig_key = f"{sym}_{sig_name}_{tf}"
+
+                    with _proc_lock:
+                        already = _processed_signals.get(sig_key)
+                        if already == sig_data['time']:
+                            continue   # sudah pernah dikirim sebelumnya
+                        _processed_signals[sig_key] = sig_data['time']
+
+                    # Tandai sebagai sinyal missed di label & caption
+                    missed_sig_name = f"[MISSED] {sig_name}"
+                    label           = f"⏪ {SIGNAL_LABEL.get(sig_name, sig_name)}"
+                    icon            = SIGNAL_ICON.get(sig_data['tipe'], '⚪')
+                    tf_em           = TF_EMOJI.get(tf, '')
+                    mtf_blk         = _format_mtf_block(mtf)
+                    candle_time     = sig_data['time']
+
+                    caption = (
+                        f"⏪ {icon} <b>MISSED SIGNAL — {label} {sig_data['tipe']}</b>\n"
+                        f"──────────────────────\n"
+                        f"💎 <b>Symbol  :</b> {sym}\n"
+                        f"🏷 <b>Sinyal  :</b> {sig_name}\n"
+                        f"{tf_em} <b>TF      :</b> {tf.upper()}\n"
+                        f"💰 <b>Harga   :</b> {sig_data['price']:.6g}\n"
+                        f"📈 <b>24h Chg :</b> {change:+.2f}%\n"
+                        f"🕯 <b>Candle  :</b> {candle_time}\n"
+                        f"──────────────────────\n"
+                        f"📐 <b>Multi-TF Bias:</b>\n{mtf_blk}\n"
+                        f"──────────────────────\n"
+                        f"📝 <b>Analisa :</b> {sig_data['explanation']}\n"
+                        f"⚠️  <i>Sinyal ini terdeteksi saat bot offline</i>\n"
+                        f"🕒 Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+
+                    print(
+                        f"  ⏪ [{tf.upper()}] {sym:<22} | "
+                        f"{SIGNAL_LABEL.get(sig_name, sig_name)} "
+                        f"{sig_data['tipe']:<4} @ {sig_data['price']:.6g} "
+                        f"(candle: {candle_time})"
+                    )
+
+                    # Kirim text saja (tanpa chart) agar startup cepat
+                    base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+                    try:
+                        with _tg_lock:
+                            requests.post(
+                                f"{base}/sendMessage",
+                                data={
+                                    'chat_id':    TELEGRAM_CHAT_ID,
+                                    'text':       caption,
+                                    'parse_mode': 'HTML',
+                                },
+                                timeout=20,
+                            )
+                    except Exception as e:
+                        print(f"  [TG Missed Error] {e}")
+
+                    total_missed += 1
+                    time.sleep(MISSED_SIGNAL_DELAY)   # anti-flood Telegram
+
+    if total_missed:
+        print(f"\n  ✅ Missed scan selesai — {total_missed} sinyal terlewat dikirim.")
+        send_telegram_text(
+            f"⏪ <b>Missed Signal Scan Selesai</b>\n"
+            f"Total sinyal terlewat dikirim: <b>{total_missed}</b>\n"
+            f"Bot kini masuk mode LIVE (WebSocket)."
+        )
+    else:
+        print("  ✅ Missed scan selesai — tidak ada sinyal terlewat.")
 
 # ==========================================
 # 16. WEBSOCKET — koneksi kline stream
@@ -996,11 +1192,15 @@ def main():
     # ── Register stream lookup ─────────────────────────────────
     _register_streams(symbols)
 
+    # ── Scan sinyal terlewatkan (sebelum WebSocket live) ───────
+    scan_missed_signals(symbols)
+
     send_telegram_text(
         f"🚀 <b>BBMA Bot AKTIF — WebSocket + REST Fallback</b>\n"
         f"Data: WebSocket realtime, REST hanya saat data kurang\n"
         f"Sinyal: RE ENTRY · MMT · EXTREME\n"
         f"TF: 1H · 4H · 1D · 1W — {len(symbols)} simbol\n"
+        f"⏪ Missed signal scan: selesai, mode LIVE dimulai\n"
         f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
