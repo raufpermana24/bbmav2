@@ -33,6 +33,7 @@ import threading
 import warnings
 import concurrent.futures
 import numpy as np
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -62,7 +63,6 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',   '8361349338:AAHOlx4fKz_bp1MHnVg8CxS9MY_pcejxLes')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003979979885')
-
 
 # ── Timeframe ──────────────────────────────────────────────────
 TIMEFRAMES = ['1h', '4h', '1d', '1w']
@@ -105,9 +105,99 @@ STATE_FILE = DATA_DIR / '_state.json'
 DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
+# ==========================================
+# TERMINAL DISPLAY — Warna & Animasi VPS
+# ==========================================
+class C:
+    """ANSI color codes — auto-disable jika terminal tidak support."""
+    _on = sys.stdout.isatty() or os.environ.get('FORCE_COLOR', '0') == '1'
+    RESET  = '\033[0m'    if _on else ''
+    BOLD   = '\033[1m'    if _on else ''
+    DIM    = '\033[2m'    if _on else ''
+    # Foreground
+    WHITE  = '\033[97m'   if _on else ''
+    CYAN   = '\033[96m'   if _on else ''
+    GREEN  = '\033[92m'   if _on else ''
+    YELLOW = '\033[93m'   if _on else ''
+    RED    = '\033[91m'   if _on else ''
+    BLUE   = '\033[94m'   if _on else ''
+    MAGENTA= '\033[95m'   if _on else ''
+    ORANGE = '\033[33m'   if _on else ''
+    GRAY   = '\033[90m'   if _on else ''
+
+def _tw() -> int:
+    """Lebar terminal, default 80."""
+    return shutil.get_terminal_size((80, 24)).columns
+
+def _sep(char='═', color=C.CYAN) -> str:
+    return color + char * min(_tw(), 68) + C.RESET
+
+def _hdr(title: str, icon: str = ''):
+    w = min(_tw(), 68)
+    inner = f"  {icon}  {title}  " if icon else f"  {title}  "
+    pad   = max(0, w - len(inner))
+    print(_sep('═'))
+    print(C.CYAN + C.BOLD + inner + ' ' * pad + C.RESET)
+    print(_sep('═'))
+
+def _ok(msg: str):
+    print(f"  {C.GREEN}✅ {msg}{C.RESET}")
+
+def _warn(msg: str):
+    print(f"  {C.YELLOW}⚠️  {msg}{C.RESET}")
+
+def _err(msg: str):
+    print(f"  {C.RED}❌ {msg}{C.RESET}")
+
+def _info(msg: str):
+    print(f"  {C.CYAN}ℹ️  {msg}{C.RESET}")
+
+def _dim(msg: str):
+    print(f"  {C.GRAY}{msg}{C.RESET}")
+
+def _signal_line(icon: str, label: str, sym: str, tf: str,
+                 price: float, extra: str = ''):
+    dir_col = C.GREEN if 'BUY' in label else C.RED
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(
+        f"  {C.GRAY}[{ts}]{C.RESET} "
+        f"{dir_col}{icon}{C.RESET} "
+        f"{C.BOLD}{C.WHITE}{label:<14}{C.RESET} "
+        f"{C.YELLOW}{sym:<22}{C.RESET} "
+        f"{C.CYAN}{tf.upper():<3}{C.RESET}  "
+        f"{C.GREEN}${price:.6g}{C.RESET}"
+        f"  {C.GRAY}{extra}{C.RESET}"
+    )
+
+def _progress(done: int, total: int, label: str = '', width: int = 30):
+    """Cetak progress bar inline (overwrite baris yang sama)."""
+    pct    = done / total if total else 0
+    filled = int(pct * width)
+    bar    = C.GREEN + '█' * filled + C.GRAY + '░' * (width - filled) + C.RESET
+    pct_s  = f"{C.YELLOW}{pct*100:5.1f}%{C.RESET}"
+    cnt_s  = f"{C.WHITE}{done}/{total}{C.RESET}"
+    lbl_s  = f" {C.GRAY}{label}{C.RESET}" if label else ''
+    sys.stdout.write(f"\r  [{bar}] {pct_s}  {cnt_s}{lbl_s}   ")
+    sys.stdout.flush()
+
+def _progress_end():
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+
+def _spinner_msg(msg: str, done: bool = False):
+    """Tampil satu baris status dengan ikon."""
+    icon = f"{C.GREEN}✓{C.RESET}" if done else f"{C.YELLOW}…{C.RESET}"
+    ts   = datetime.now().strftime('%H:%M:%S')
+    print(f"  {C.GRAY}[{ts}]{C.RESET} {icon}  {msg}")
+
+def _section(title: str, icon: str = '▶'):
+    print()
+    print(f"  {C.BOLD}{C.CYAN}{icon} {title}{C.RESET}")
+    print(f"  {C.GRAY}{'─' * (min(_tw(), 64) - 2)}{C.RESET}")
+
 # ── Missed signal scan saat startup ──────────────────────────
 # Hanya scan sinyal dalam 8 jam ke belakang dari waktu bot start
-MISSED_LOOKBACK_SECONDS = 14400  # 8 jam
+MISSED_LOOKBACK_SECONDS = 28800  # 8 jam
 # Jeda antar pengiriman sinyal terlewat (detik), hindari flood TG
 MISSED_SIGNAL_DELAY = 1.5
 
@@ -159,7 +249,7 @@ def _rest_call(fn, *args, **kwargs):
     for attempt in range(REST_MAX_RETRY + 1):
         ban_wait = max(_ban_until_ts - time.time(), 0)
         if ban_wait > 0:
-            print(f"  ⏸️  REST ban aktif, tunggu {ban_wait:.0f}s...")
+            print(f"  {C.YELLOW}⏸️  REST ban aktif, tunggu {ban_wait:.0f}s...{C.RESET}")
             time.sleep(ban_wait + 1)
 
         with _rest_lock:
@@ -283,7 +373,7 @@ def _fetch_binance_open_interest() -> dict:
             pass
         return sym, 0.0
 
-    print(f"  📊 Mengambil Open Interest {len(usdt_perp)} simbol USDT perpetual...")
+    _section("Mengambil Open Interest semua simbol USDT perpetual", "📊")
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         futures_oi = {ex.submit(_fetch_oi, s): s for s in usdt_perp}
         for fut in concurrent.futures.as_completed(futures_oi):
@@ -299,7 +389,7 @@ def get_all_futures_symbols() -> list:
     urutkan berdasarkan Open Interest (USD) sebagai proxy market cap,
     kembalikan TOP_N teratas.
     """
-    print(f"  📡 Menyusun Top-{TOP_N} Binance Futures berdasarkan Open Interest...")
+    _section(f"Menyusun Top-{TOP_N} Binance Futures berdasarkan Open Interest", "📡")
 
     result = _fetch_binance_open_interest()
     if not result or not result[0]:
@@ -330,15 +420,24 @@ def get_all_futures_symbols() -> list:
     top = ranked[:TOP_N]
 
     # ── Cetak ranking ──────────────────────────────────────────
-    print(f"\n  🏆 TOP-{TOP_N} BINANCE FUTURES — diurutkan Open Interest (USD)")
-    print(f"  {'#':>3}  {'Simbol':<14} {'Open Interest (USD)':>22}  {'Volume 24h (USD)':>20}")
-    print(f"  {'─'*3}  {'─'*14} {'─'*22}  {'─'*20}")
+    _section(f"TOP-{TOP_N} BINANCE FUTURES — Open Interest (USD)", "🏆")
+    hdr = (f"  {C.BOLD}{C.GRAY}{'#':>3}  {'Simbol':<18} "
+           f"{'Open Interest (USD)':>22}  {'Volume 24h':>18}{C.RESET}")
+    print(hdr)
+    print(f"  {C.GRAY}{'─'*3}  {'─'*18} {'─'*22}  {'─'*18}{C.RESET}")
     for i, c in enumerate(top, 1):
         oi_str  = f"${c['oi_usd']:>20,.0f}"
-        vol_str = f"${c['volume']:>18,.0f}"
-        print(f"  {i:>3}. {c['symbol']:<14} {oi_str}  {vol_str}")
+        vol_str = f"${c['volume']:>16,.0f}"
+        num_col = C.YELLOW if i <= 3 else C.GRAY
+        print(
+            f"  {num_col}{i:>3}.{C.RESET} "
+            f"{C.WHITE}{c['symbol']:<18}{C.RESET} "
+            f"{C.GREEN}{oi_str}{C.RESET}  "
+            f"{C.CYAN}{vol_str}{C.RESET}"
+        )
 
-    print(f"\n  ✅ {len(top)} simbol aktif (dari {len(ranked)} total, top-{TOP_N} by OI)")
+    print()
+    _ok(f"{len(top)} simbol aktif (dari {len(ranked)} total, top-{TOP_N} by OI)")
     return top
 
 
@@ -511,8 +610,11 @@ def rest_seed_all(symbols: list):
         ok = rest_seed_one(sym, tf)
         return 'rest' if ok else 'fail'
 
-    print(f"\n  🌱 Seed historis {len(symbols)} simbol × {len(TIMEFRAMES)} TF "
-          f"({MAX_SEED_THREADS} thread paralel)...")
+    _section(
+        f"Seed historis {len(symbols)} simbol × {len(TIMEFRAMES)} TF "
+        f"({MAX_SEED_THREADS} thread paralel)",
+        "🌱"
+    )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEED_THREADS) as ex:
         futs = {ex.submit(_seed_one, coin, tf): (coin['symbol'], tf)
@@ -522,14 +624,16 @@ def rest_seed_all(symbols: list):
             src = f.result()
             if src != 'fail':
                 seeded += 1
-            if done % 50 == 0 or done == total:
-                sys.stdout.write(
-                    f"\r  Seed: {done}/{total}  "
-                    f"(✅ {seeded} ok | ❌ {done - seeded} gagal)   "
-                )
-                sys.stdout.flush()
+            sym_name, tf_name = futs[f]
+            src_tag = (f"{C.CYAN}[disk]{C.RESET}" if src == 'disk'
+                       else f"{C.YELLOW}[REST]{C.RESET}" if src == 'rest'
+                       else f"{C.RED}[FAIL]{C.RESET}")
+            _progress(done, total,
+                      label=f"{src_tag} {C.WHITE}{sym_name.split('/')[0]:<6}{C.RESET} {C.GRAY}{tf_name}{C.RESET}")
 
-    print(f"\n  ✅ Seed selesai — {seeded}/{total} berhasil.")
+    _progress_end()
+    _ok(f"Seed selesai — {C.GREEN}{seeded}{C.RESET}/{total} berhasil  "
+        f"({C.RED}{done - seeded} gagal{C.RESET})")
 
 # ==========================================
 # 9. REST FALLBACK — tambal gap setelah WS disconnect / data kurang
@@ -953,10 +1057,9 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
             _processed_signals[sig_key] = sig_data['time']
 
         label = SIGNAL_LABEL.get(sig_name, sig_name)
-        print(
-            f"  🔔 [{tf.upper()}] {symbol:<22} | "
-            f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
-        )
+        icon  = '🟢' if sig_data['tipe'] == 'BUY' else '🔴'
+        _signal_line(icon, f"{label} {sig_data['tipe']}",
+                     symbol, tf, sig_data['price'])
 
         img = generate_chart(df, symbol, sig_name, tf)
         send_telegram_alert(
@@ -986,10 +1089,12 @@ def scan_missed_signals(symbols: list):
     now_ts     = pd.Timestamp.now(tz='UTC').tz_localize(None)
     cutoff_ts  = now_ts - pd.Timedelta(seconds=MISSED_LOOKBACK_SECONDS)
 
-    print("\n" + "=" * 65)
-    print("  ⏪  SCANNING SINYAL 8 JAM TERAKHIR (Missed Signal Scan)...")
-    print(f"  Rentang  : {cutoff_ts.strftime('%Y-%m-%d %H:%M')} → sekarang")
-    print("=" * 65)
+    print()
+    _sep_line = _sep('═')
+    print(_sep_line)
+    print(f"  {C.BOLD}{C.MAGENTA}⏪  SCANNING SINYAL 8 JAM TERAKHIR (Missed Signal Scan)...{C.RESET}")
+    print(f"  {C.GRAY}Rentang  : {cutoff_ts.strftime('%Y-%m-%d %H:%M')} → sekarang{C.RESET}")
+    print(_sep_line)
 
     total_missed = 0
 
@@ -1071,11 +1176,12 @@ def scan_missed_signals(symbols: list):
                         f"🕒 Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
 
-                    print(
-                        f"  ⏪ [{tf.upper()}] {sym:<22} | "
-                        f"{SIGNAL_LABEL.get(sig_name, sig_name)} "
-                        f"{sig_data['tipe']:<4} @ {sig_data['price']:.6g} "
-                        f"(candle: {candle_time})"
+                    icon_ms = '🟢' if sig_data['tipe'] == 'BUY' else '🔴'
+                    _signal_line(
+                        icon_ms,
+                        f"⏪ {SIGNAL_LABEL.get(sig_name, sig_name)} {sig_data['tipe']}",
+                        sym, tf, sig_data['price'],
+                        extra=f"candle: {candle_time}"
                     )
 
                     # Generate chart BBMA (sama seperti sinyal live)
@@ -1114,14 +1220,15 @@ def scan_missed_signals(symbols: list):
                     time.sleep(MISSED_SIGNAL_DELAY)   # anti-flood Telegram
 
     if total_missed:
-        print(f"\n  ✅ Missed scan selesai — {total_missed} sinyal dikirim.")
+        print()
+        _ok(f"Missed scan selesai — {C.YELLOW}{total_missed}{C.RESET} sinyal dikirim ke Telegram.")
         send_telegram_text(
             f"⏪ <b>Missed Signal Scan Selesai</b>\n"
             f"Sinyal terlewat (8 jam terakhir): <b>{total_missed}</b>\n"
             f"Bot kini masuk mode LIVE (WebSocket)."
         )
     else:
-        print("  ✅ Missed scan selesai — tidak ada sinyal dalam 8 jam terakhir.")
+        _ok("Missed scan selesai — tidak ada sinyal dalam 8 jam terakhir.")
 
 # ==========================================
 # 16. WEBSOCKET — koneksi kline stream
@@ -1214,8 +1321,11 @@ class KlineWsConnection:
             print(f"  [WS-{self.conn_id}] Terputus ({code}) — reconnect...")
 
     def _on_open(self, ws):
-        print(f"  [WS-{self.conn_id}] ✅ Terhubung "
-              f"({len(self.stream_names)} stream)")
+        _spinner_msg(
+            f"{C.WHITE}WS-{self.conn_id}{C.RESET} terhubung — "
+            f"{C.YELLOW}{len(self.stream_names)}{C.RESET} stream aktif",
+            done=True
+        )
 
     # ── REST fallback setelah reconnect ──────────────────────
     def _fill_gaps_after_reconnect(self):
@@ -1284,8 +1394,11 @@ def launch_websocket_connections(symbols: list,
         for i in range(0, len(all_streams), WS_MAX_STREAMS)
     ]
 
-    print(f"\n  📡 WebSocket: {len(all_streams)} stream "
-          f"→ {len(batches)} koneksi (maks {WS_MAX_STREAMS}/koneksi)")
+    _section(
+        f"WebSocket: {len(all_streams)} stream → {len(batches)} koneksi "
+        f"(maks {WS_MAX_STREAMS}/koneksi)",
+        "📡"
+    )
 
     result = []
     for idx, batch in enumerate(batches):
@@ -1345,25 +1458,31 @@ def state_save_daemon(state: dict, stop_event: threading.Event):
 def main():
     global _processed_signals
 
-    print("=" * 65)
-    print("  🚀  BBMA OMA ALLY — BINANCE FUTURES  (WebSocket + REST)")
-    print("=" * 65)
-    print(f"  Simbol   : Top-{TOP_N} Binance Futures (rank by Open Interest)")
-    print(f"  Data     : WebSocket realtime (REST hanya seed & fallback)")
-    print(f"  TF       : {' · '.join(tf.upper() for tf in TIMEFRAMES)}")
-    print(f"  Sinyal   : RE ENTRY · MMT · EXTREME  (BUY & SELL)")
-    print(f"  Output   : {DATA_DIR}/  |  Chart: {CHART_DIR}/")
-    print("=" * 65)
+    # ── Banner ─────────────────────────────────────────────────
+    print()
+    print(_sep('═'))
+    print(f"  {C.BOLD}{C.CYAN}🚀  BBMA OMA ALLY — BINANCE FUTURES  (WebSocket + REST){C.RESET}")
+    print(_sep('─'))
+    print(f"  {C.GRAY}Simbol   :{C.RESET} {C.YELLOW}Top-{TOP_N}{C.RESET} Binance Futures (rank by Open Interest)")
+    print(f"  {C.GRAY}Data     :{C.RESET} {C.GREEN}WebSocket realtime{C.RESET} (REST hanya seed & fallback)")
+    print(f"  {C.GRAY}TF       :{C.RESET} {C.CYAN}" + " · ".join(tf.upper() for tf in TIMEFRAMES) + C.RESET)
+    print(f"  {C.GRAY}Sinyal   :{C.RESET} {C.MAGENTA}RE ENTRY · MMT · EXTREME{C.RESET}  (BUY & SELL)")
+    print(f"  {C.GRAY}Output   :{C.RESET} {DATA_DIR}/  |  Chart: {CHART_DIR}/")
+    print(f"  {C.GRAY}Waktu    :{C.RESET} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(_sep('═'))
+    print()
 
     # ── Load state ────────────────────────────────────────────
     state = load_state()
     with _proc_lock:
         _processed_signals.update(state.get('processed_signals', {}))
+    _spinner_msg(f"State dimuat — {C.YELLOW}{len(_processed_signals)}{C.RESET} sinyal tercatat", done=True)
 
     # ── Ambil daftar simbol (REST 1x) ─────────────────────────
+    _section("Mengambil daftar simbol Binance Futures", "🔄")
     symbols = get_all_futures_symbols()
     while not symbols:
-        print("  Gagal ambil market. Retry 30s...")
+        _warn("Gagal ambil market. Retry 30s...")
         time.sleep(30)
         symbols = get_all_futures_symbols()
 
@@ -1372,16 +1491,18 @@ def main():
     state['last_market_fetch'] = time.time()
     save_state(state)
 
-    # ── Seed historis: disk → REST fallback ───────────────────
-    # (WebSocket hanya kirim candle running, tidak punya data lama)
+    # ── Seed historis ─────────────────────────────────────────
     rest_seed_all(symbols)
 
     # ── Register stream lookup ─────────────────────────────────
     _register_streams(symbols)
+    _spinner_msg(f"Stream map terdaftar — "
+                 f"{C.YELLOW}{len(symbols) * len(TIMEFRAMES)}{C.RESET} stream", done=True)
 
-    # ── Scan sinyal terlewatkan (sebelum WebSocket live) ───────
+    # ── Scan sinyal terlewatkan ────────────────────────────────
     scan_missed_signals(symbols)
 
+    # ── Notif Telegram aktif ───────────────────────────────────
     send_telegram_text(
         f"🚀 <b>BBMA Bot AKTIF — Top-{TOP_N} Binance Futures</b>\n"
         f"Simbol: Top-{TOP_N} by Open Interest (USD)\n"
@@ -1412,14 +1533,27 @@ def main():
     t_save.start()
     all_threads.append(t_save)
 
-    print(f"\n  ✅ Bot aktif — {len(ws_pairs)} koneksi WebSocket")
-    print("  Tekan Ctrl+C untuk berhenti.\n")
+    print()
+    print(_sep('═'))
+    print(f"  {C.BOLD}{C.GREEN}✅ Bot aktif — {len(ws_pairs)} koneksi WebSocket{C.RESET}")
+    print(f"  {C.GRAY}Simbol   : {C.YELLOW}{len(symbols)}{C.GRAY} koin dipantau{C.RESET}")
+    print(f"  {C.GRAY}Threads  : {C.YELLOW}{threading.active_count()}{C.GRAY} aktif{C.RESET}")
+    print(f"  {C.GRAY}Mode     : {C.GREEN}LIVE — menunggu candle close...{C.RESET}")
+    print(f"  {C.GRAY}Stop     : Ctrl+C untuk berhenti{C.RESET}")
+    print(_sep('═'))
+    print()
+
+    # ── Live signal header ─────────────────────────────────────
+    print(f"  {C.BOLD}{C.GRAY}{'WAKTU':<10} {'DIR':<6} {'SINYAL':<14} {'SIMBOL':<22} {'TF':<4} {'HARGA'}{C.RESET}")
+    print(f"  {C.GRAY}{'─'*10} {'─'*6} {'─'*14} {'─'*22} {'─'*4} {'─'*12}{C.RESET}")
 
     try:
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
-        print("\n⛔ Menghentikan bot...")
+        print()
+        print(_sep('─'))
+        _warn("Menghentikan bot (Ctrl+C)...")
         stop_event.set()
         for _, conn in ws_pairs:
             conn.stop()
@@ -1429,7 +1563,8 @@ def main():
             state['processed_signals'] = dict(_processed_signals)
         save_state(state)
         send_telegram_text("⛔ <b>BBMA Bot dihentikan.</b>")
-        print("✅ Bot berhenti.")
+        _ok("Bot berhenti.")
+        print()
 
 
 if __name__ == "__main__":
