@@ -47,6 +47,7 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',   '8361349338:AAHOlx4fKz_bp1MHnVg8CxS9MY_pcejxLes')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003964469739')
 
+
 # ── Timeframe ──────────────────────────────────────────────────
 TIMEFRAMES = ['1h', '4h', '1d', '1w']
 
@@ -577,81 +578,92 @@ def get_due_timeframes(last_close: dict) -> list:
     ]
 
 # ==========================================
-# 15. MAIN LOOP
+# 15. SHARED STATE (thread-safe)
 # ==========================================
-def main():
-    print("=" * 65)
-    print("  🚀  BBMA OMA ALLY — BINANCE FUTURES  (ALL-IN-ONE)")
-    print("=" * 65)
-    print(f"  Market   : Semua pasang USDT Binance Futures")
-    print(f"  TF       : {' · '.join(tf.upper() for tf in TIMEFRAMES)}")
-    print(f"  Sinyal   : RE ENTRY · MMT · EXTREME  (BUY & SELL)")
-    print(f"  Timing   : Per-close candle tiap TF")
-    print(f"  Data     : {DATA_DIR}/  |  Chart: {CHART_DIR}/")
-    print("=" * 65)
+import threading
 
-    state             = load_state()
-    processed_signals = state.get('processed_signals', {})
-    last_close        = state.get('last_close', {tf: 0.0 for tf in TIMEFRAMES})
-    symbols: list     = []
+_state_lock      = threading.Lock()   # melindungi processed_signals & last_close
+_symbols_lock    = threading.Lock()   # melindungi daftar symbols
+_tg_lock         = threading.Lock()   # satu-per-satu kirim ke Telegram
+_shared_symbols  = []                 # dipakai semua thread TF
+
+
+def _get_symbols() -> list:
+    with _symbols_lock:
+        return list(_shared_symbols)
+
+
+def _set_symbols(sym_list: list):
+    global _shared_symbols
+    with _symbols_lock:
+        _shared_symbols.clear()
+        _shared_symbols.extend(sym_list)
+
+
+# ==========================================
+# 16. WORKER PER-TIMEFRAME
+# ==========================================
+def tf_worker(tf: str, state: dict, stop_event: threading.Event):
+    """
+    Thread mandiri untuk satu timeframe.
+    Looping sendiri: tunggu close → download → scan → kirim.
+    """
+    processed_signals = state['processed_signals']
+    last_close        = state['last_close']
+    dur               = TF_DURATION_SEC[tf]
+    tf_up             = tf.upper()
     first_run         = True
 
-    send_telegram_text(
-        f"🚀 <b>BBMA Bot AKTIF — Binance Futures</b>\n"
-        f"Sinyal: RE ENTRY · MMT · EXTREME\n"
-        f"TF: 1H · 4H · 1D · 1W\n"
-        f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    print(f"  🔧 [{tf_up}] Worker dimulai.")
 
-    while True:
+    while not stop_event.is_set():
         try:
             now = time.time()
 
-            # ── Refresh daftar simbol tiap 1 jam ─────────────
-            if not symbols or now - state.get('last_market_fetch', 0) > 3600:
-                symbols = get_all_futures_symbols()
-                state['last_market_fetch'] = now
-                save_state(state)
-                if not symbols:
-                    print("  Gagal ambil market. Retry 30s...")
-                    time.sleep(30)
-                    continue
+            # ── Cek apakah candle sudah close ─────────────────
+            current_close = int(now / dur) * dur
+            with _state_lock:
+                last = last_close.get(tf, 0.0)
 
-            # ── Tentukan TF mana yang perlu di-scan ──────────
-            active_tfs = TIMEFRAMES[:] if first_run else get_due_timeframes(last_close)
-            first_run  = False
+            if not first_run and last >= current_close:
+                # Belum ada candle baru — hitung waktu tunggu
+                wait_sec = max(int(seconds_until_next_close(tf)) - 5, 10)
+                if wait_sec > 120:
+                    # Tidur bertahap agar bisa dihentikan dengan cepat
+                    for _ in range(wait_sec // 30):
+                        if stop_event.is_set():
+                            return
+                        time.sleep(30)
+                    time.sleep(wait_sec % 30)
+                else:
+                    time.sleep(min(wait_sec, 60))
+                continue
 
-            if not active_tfs:
-                waits    = {tf: seconds_until_next_close(tf) for tf in TIMEFRAMES}
-                next_tf  = min(waits, key=waits.get)
-                wait_sec = max(int(waits[next_tf]) - 5, 10)
-                print(
-                    f"  ⏳ [{datetime.now().strftime('%H:%M:%S')}] "
-                    f"Menunggu close {next_tf.upper()} dalam ~{wait_sec}s"
-                )
-                time.sleep(min(wait_sec, 60))
+            first_run = False
+
+            symbols = _get_symbols()
+            if not symbols:
+                time.sleep(10)
                 continue
 
             print(
                 f"\n[{datetime.now().strftime('%H:%M:%S')}] "
-                f"⏰ Candle close: {' | '.join(tf.upper() for tf in active_tfs)} "
-                f"— {len(symbols)} simbol"
+                f"⏰ [{tf_up}] Candle close — {len(symbols)} simbol"
             )
-
             scan_start = time.time()
 
-            # ── FASE 1: Download & simpan data ───────────────
-            saved_data = phase1_download(symbols, active_tfs)
+            # ── FASE 1: Download data untuk TF ini ────────────
+            saved_data = phase1_download(symbols, [tf])
 
-            # Catat waktu close yang sudah di-scan
-            for tf in active_tfs:
-                dur = TF_DURATION_SEC[tf]
-                last_close[tf] = int(now / dur) * dur
+            # Catat waktu close
+            with _state_lock:
+                last_close[tf] = current_close
 
             # ── FASE 2: Scan sinyal ───────────────────────────
-            all_alerts = phase2_scan(symbols, active_tfs, saved_data, processed_signals)
+            with _state_lock:
+                proc_copy = dict(processed_signals)
 
-            # Urutkan: TF lebih tinggi dulu (1w > 1d > 4h > 1h)
+            all_alerts = phase2_scan(symbols, [tf], saved_data, proc_copy)
             all_alerts.sort(key=lambda x: x['priority'], reverse=True)
 
             # ── Kirim sinyal ke Telegram ──────────────────────
@@ -659,58 +671,144 @@ def main():
             for alert in all_alerts:
                 sym      = alert['symbol']
                 sig_name = alert['signal']
-                tf       = alert['timeframe']
                 sig_data = alert['data']
                 mtf      = alert['mtf'] or {}
 
-                # Tandai sudah dikirim
-                processed_signals[alert['sig_key']] = sig_data['time']
+                with _state_lock:
+                    processed_signals[alert['sig_key']] = sig_data['time']
 
                 label = SIGNAL_LABEL.get(sig_name, sig_name)
                 print(
-                    f"  🔔 {sym:<22} | {tf.upper():>3} | "
+                    f"  🔔 [{tf_up}] {sym:<22} | "
                     f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
                 )
 
                 img = generate_chart(alert['df'], sym, sig_name, tf)
-                send_telegram_alert(
-                    symbol=sym, signal_name=sig_name, timeframe=tf,
-                    data=sig_data, change_24h=alert['24h_change'],
-                    mtf=mtf, image_path=img,
-                )
+                with _tg_lock:
+                    send_telegram_alert(
+                        symbol=sym, signal_name=sig_name, timeframe=tf,
+                        data=sig_data, change_24h=alert['24h_change'],
+                        mtf=mtf, image_path=img,
+                    )
                 sent_count += 1
-                time.sleep(0.4)   # throttle agar tidak flood Telegram
+                time.sleep(0.4)
 
             dur_total = time.time() - scan_start
             print(
-                f"\n  📊 Ringkasan: {len(symbols)} simbol | "
-                f"{sent_count} sinyal dikirim | {dur_total:.1f}s"
+                f"  📊 [{tf_up}] Selesai: {len(symbols)} simbol | "
+                f"{sent_count} sinyal | {dur_total:.1f}s"
             )
             if sent_count == 0:
-                print("  (Tidak ada sinyal baru pada candle ini)")
+                print(f"  [{tf_up}] Tidak ada sinyal baru.")
 
-            # ── Simpan state ke disk ──────────────────────────
-            state['processed_signals'] = processed_signals
-            state['last_close']        = last_close
-            save_state(state)
+            # ── Simpan state ──────────────────────────────────
+            with _state_lock:
+                state['processed_signals'] = processed_signals
+                state['last_close']        = last_close
+                save_state(state)
 
-            # ── Tunggu close candle berikutnya ────────────────
-            waits    = {tf: seconds_until_next_close(tf) for tf in TIMEFRAMES}
-            next_tf  = min(waits, key=waits.get)
-            wait_sec = max(int(waits[next_tf]) - 10, 30)
-            print(f"  ⏳ Menunggu close berikutnya: {next_tf.upper()} dalam ~{wait_sec}s")
-            time.sleep(min(wait_sec, 120))
-
-        except KeyboardInterrupt:
-            print("\n⛔ Bot dihentikan.")
-            state['processed_signals'] = processed_signals
-            state['last_close']        = last_close
-            save_state(state)
-            send_telegram_text("⛔ <b>BBMA Bot dihentikan.</b>")
-            break
         except Exception as e:
-            print(f"  [Main Error] {e}")
+            print(f"  [{tf_up} Error] {e}")
             time.sleep(15)
+
+    print(f"  🛑 [{tf_up}] Worker dihentikan.")
+
+
+# ==========================================
+# 17. SYMBOL REFRESH DAEMON
+# ==========================================
+def symbol_refresh_daemon(state: dict, stop_event: threading.Event):
+    """Refresh daftar simbol tiap 1 jam di background thread."""
+    while not stop_event.is_set():
+        now = time.time()
+        if now - state.get('last_market_fetch', 0) > 3600 or not _shared_symbols:
+            symbols = get_all_futures_symbols()
+            if symbols:
+                _set_symbols(symbols)
+                with _state_lock:
+                    state['last_market_fetch'] = now
+                    save_state(state)
+            else:
+                print("  ⚠️  Gagal refresh market, akan retry...")
+        # Cek tiap 60 detik
+        for _ in range(60):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+
+
+# ==========================================
+# 18. MAIN — JALANKAN SEMUA THREAD
+# ==========================================
+def main():
+    print("=" * 65)
+    print("  🚀  BBMA OMA ALLY — BINANCE FUTURES  (PARALLEL TF)")
+    print("=" * 65)
+    print(f"  Market   : Semua pasang USDT Binance Futures")
+    print(f"  TF       : {' · '.join(tf.upper() for tf in TIMEFRAMES)}  ← berjalan BERSAMAAN")
+    print(f"  Sinyal   : RE ENTRY · MMT · EXTREME  (BUY & SELL)")
+    print(f"  Timing   : Per-close candle, tiap TF punya thread sendiri")
+    print(f"  Data     : {DATA_DIR}/  |  Chart: {CHART_DIR}/")
+    print("=" * 65)
+
+    state = load_state()
+
+    # ── Ambil market pertama kali (blokir sampai berhasil) ────
+    symbols = get_all_futures_symbols()
+    while not symbols:
+        print("  Gagal ambil market. Retry 30s...")
+        time.sleep(30)
+        symbols = get_all_futures_symbols()
+    _set_symbols(symbols)
+    state['last_market_fetch'] = time.time()
+    save_state(state)
+
+    send_telegram_text(
+        f"🚀 <b>BBMA Bot AKTIF — Binance Futures (Parallel TF)</b>\n"
+        f"Sinyal: RE ENTRY · MMT · EXTREME\n"
+        f"TF: 1H · 4H · 1D · 1W  ← Scan bersamaan!\n"
+        f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    stop_event = threading.Event()
+    threads    = []
+
+    # ── Thread refresh simbol ──────────────────────────────────
+    t_sym = threading.Thread(
+        target=symbol_refresh_daemon,
+        args=(state, stop_event),
+        name="SymbolRefresh", daemon=True,
+    )
+    t_sym.start()
+    threads.append(t_sym)
+
+    # ── Satu thread per timeframe ──────────────────────────────
+    for tf in TIMEFRAMES:
+        t = threading.Thread(
+            target=tf_worker,
+            args=(tf, state, stop_event),
+            name=f"TF-{tf.upper()}", daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        time.sleep(0.5)   # stagger sedikit agar print tidak tabrakan
+
+    print(f"\n  ✅ {len(TIMEFRAMES)} thread TF aktif + 1 thread symbol refresh")
+    print("  Tekan Ctrl+C untuk menghentikan bot.\n")
+
+    try:
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n⛔ Menghentikan semua thread...")
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=10)
+        with _state_lock:
+            state['processed_signals'] = state.get('processed_signals', {})
+            save_state(state)
+        send_telegram_text("⛔ <b>BBMA Bot dihentikan.</b>")
+        print("✅ Bot berhenti.")
 
 
 if __name__ == "__main__":
