@@ -101,6 +101,10 @@ MISSED_LOOKBACK_SECONDS = 28800  # 8 jam
 # Jeda antar pengiriman sinyal terlewat (detik), hindari flood TG
 MISSED_SIGNAL_DELAY = 1.5
 
+# ── Periodic scan setiap 10 menit ─────────────────────────────
+PERIODIC_SCAN_INTERVAL = 600   # 10 menit (detik)
+PERIODIC_SCAN_WORKERS  = 8     # thread paralel saat scan berkala
+
 # ── Label sinyal ──────────────────────────────────────────────
 ALLOWED_SIGNALS = {
     'REENTRY BUY', 'REENTRY SELL',
@@ -983,6 +987,128 @@ def scan_missed_signals(symbols: list):
         print("  ✅ Missed scan selesai — tidak ada sinyal dalam 8 jam terakhir.")
 
 # ==========================================
+# 15c. PERIODIC SCAN DAEMON — scan sinyal tiap 10 menit
+#      (pelengkap WebSocket: jaga supaya tidak ada sinyal terlewat
+#       akibat candle yang tidak tertangkap WS atau gap kecil)
+# ==========================================
+_last_periodic_scan: float = 0.0
+_periodic_scan_lock = threading.Lock()
+
+
+def _scan_one_symbol_periodic(coin: dict) -> int:
+    """
+    Scan satu simbol di semua TF untuk sinyal terbaru (candle[-2]).
+    Return: jumlah sinyal baru yang dikirim.
+    """
+    sym    = coin['symbol']
+    change = coin.get('change', 0.0)
+    sent   = 0
+    mtf    = None   # lazy — hitung sekali jika ada sinyal
+
+    for tf in TIMEFRAMES:
+        df_raw = store_get(sym, tf)
+        if not _is_data_complete(df_raw, tf):
+            continue
+
+        df      = add_indicators(df_raw)
+        signals = compute_signals(df)   # selalu scan candle[-2] (closed terbaru)
+        if not signals:
+            continue
+
+        if mtf is None:
+            mtf = get_mtf_bias(sym)
+
+        for sig_name, sig_data in signals.items():
+            sig_key = f"{sym}_{sig_name}_{tf}"
+            with _proc_lock:
+                if _processed_signals.get(sig_key) == sig_data['time']:
+                    continue   # sudah pernah dikirim
+                _processed_signals[sig_key] = sig_data['time']
+
+            label = SIGNAL_LABEL.get(sig_name, sig_name)
+            print(
+                f"  🔄 [SCAN {tf.upper()}] {sym:<22} | "
+                f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
+            )
+
+            img = generate_chart(df, sym, sig_name, tf)
+            send_telegram_alert(
+                symbol=sym, signal_name=sig_name, timeframe=tf,
+                data=sig_data, change_24h=change,
+                mtf=mtf, image_path=img,
+            )
+            sent += 1
+            time.sleep(0.3)   # anti-flood ringan antar sinyal satu simbol
+
+    return sent
+
+
+def periodic_scan_daemon(stop_event: threading.Event):
+    """
+    Daemon yang berjalan selamanya dan men-scan seluruh simbol
+    tiap PERIODIC_SCAN_INTERVAL detik (default 10 menit).
+
+    Strategi agar cepat & hemat:
+      • Hanya baca data dari _ohlcv_store (in-memory, nol REST)
+      • Gunakan ThreadPoolExecutor untuk scan paralel antar simbol
+      • Lewati simbol yang datanya belum lengkap (langsung skip)
+      • anti-duplikat via _processed_signals — sinyal yang sudah
+        dikirim WS tidak akan dikirim ulang
+    """
+    global _last_periodic_scan
+
+    # Tunggu dulu 60 detik setelah boot agar WebSocket sudah terhubung
+    for _ in range(60):
+        if stop_event.is_set():
+            return
+        time.sleep(1)
+
+    while not stop_event.is_set():
+        now = time.time()
+
+        # Belum waktunya → tidur pendek-pendek agar responsif terhadap stop
+        if now - _last_periodic_scan < PERIODIC_SCAN_INTERVAL:
+            time.sleep(1)
+            continue
+
+        _last_periodic_scan = now
+        t_start = time.time()
+
+        with _sym_lock:
+            symbols_snap = list(_shared_symbols)   # snapshot cepat, tidak block lama
+
+        if not symbols_snap:
+            time.sleep(10)
+            continue
+
+        print(f"\n  🔄 Periodic scan dimulai — {len(symbols_snap)} simbol "
+              f"× {len(TIMEFRAMES)} TF "
+              f"[{datetime.now().strftime('%H:%M:%S')}]")
+
+        total_new = 0
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=PERIODIC_SCAN_WORKERS) as ex:
+            futs = {
+                ex.submit(_scan_one_symbol_periodic, coin): coin['symbol']
+                for coin in symbols_snap
+            }
+            for f in concurrent.futures.as_completed(futs):
+                if stop_event.is_set():
+                    break
+                try:
+                    total_new += f.result()
+                except Exception as e:
+                    print(f"  [PeriodicScan Error] {futs[f]}: {e}")
+
+        elapsed = time.time() - t_start
+        print(
+            f"  ✅ Periodic scan selesai — {total_new} sinyal baru "
+            f"dalam {elapsed:.1f}s  "
+            f"[next: {PERIODIC_SCAN_INTERVAL//60} menit lagi]"
+        )
+
+
+# ==========================================
 # 16. WEBSOCKET — koneksi kline stream
 # ==========================================
 # Lookup cepat: "btcusdt_1h" → (symbol_ccxt, tf, change_24h)
@@ -1246,6 +1372,7 @@ def main():
         f"Sinyal: RE ENTRY · MMT · EXTREME\n"
         f"TF: 1H · 4H · 1D · 1W — {len(symbols)} simbol\n"
         f"⏪ Missed signal scan: selesai, mode LIVE dimulai\n"
+        f"🔄 Periodic scan: tiap {PERIODIC_SCAN_INTERVAL//60} menit\n"
         f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -1269,6 +1396,13 @@ def main():
                               name="StateSave", daemon=True)
     t_save.start()
     all_threads.append(t_save)
+
+    # ── Periodic scan daemon (tiap 10 menit) ──────────────────
+    t_scan = threading.Thread(target=periodic_scan_daemon,
+                              args=(stop_event,),
+                              name="PeriodicScan", daemon=True)
+    t_scan.start()
+    all_threads.append(t_scan)
 
     print(f"\n  ✅ Bot aktif — {len(ws_pairs)} koneksi WebSocket")
     print("  Tekan Ctrl+C untuk berhenti.\n")
