@@ -1413,10 +1413,26 @@ def main():
     with _proc_lock:
         _processed_signals.update(state.get('processed_signals', {}))
 
+    # ════════════════════════════════════════════════════════════
+    # NOTIFIKASI 1 — Bot baru menyala
+    # ════════════════════════════════════════════════════════════
+    boot_time = datetime.now()
+    send_telegram_text(
+        f"🟡 <b>BBMA Bot MENYALA</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 Waktu  : {boot_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"📊 Status : Memulai inisialisasi...\n"
+        f"⏳ Proses : Mengambil daftar market dari Binance Futures"
+    )
+
     # ── Ambil daftar simbol (REST 1x) ─────────────────────────
     symbols = get_all_futures_symbols()
     while not symbols:
         print("  Gagal ambil market. Retry 30s...")
+        send_telegram_text(
+            f"⚠️ <b>BBMA Bot — Gagal ambil market</b>\n"
+            f"Mencoba ulang dalam 30 detik..."
+        )
         time.sleep(30)
         symbols = get_all_futures_symbols()
 
@@ -1425,25 +1441,41 @@ def main():
     state['last_market_fetch'] = time.time()
     save_state(state)
 
+    # ════════════════════════════════════════════════════════════
+    # NOTIFIKASI 2 — Mulai ambil data historis
+    # ════════════════════════════════════════════════════════════
+    send_telegram_text(
+        f"📥 <b>BBMA Bot — Mengambil Data Historis</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Simbol  : {len(symbols)} pasang futures aktif\n"
+        f"🕯 TF      : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
+        f"💾 Proses  : Seed OHLCV historis (disk → REST fallback)\n"
+        f"⏳ Mohon tunggu, proses ini memerlukan beberapa menit..."
+    )
+
     # ── Seed historis: disk → REST fallback ───────────────────
     # (WebSocket hanya kirim candle running, tidak punya data lama)
+    seed_start = time.time()
     rest_seed_all(symbols)
+    seed_elapsed = time.time() - seed_start
+
+    # ════════════════════════════════════════════════════════════
+    # NOTIFIKASI 3 — Ambil data selesai
+    # ════════════════════════════════════════════════════════════
+    send_telegram_text(
+        f"✅ <b>BBMA Bot — Pengambilan Data Selesai</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Simbol  : {len(symbols)} pasang\n"
+        f"🕯 TF      : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
+        f"⏱ Durasi  : {seed_elapsed:.0f} detik\n"
+        f"🔍 Berikutnya: Scan sinyal terlewat (8 jam terakhir)..."
+    )
 
     # ── Register stream lookup ─────────────────────────────────
     _register_streams(symbols)
 
     # ── Scan sinyal terlewatkan (sebelum WebSocket live) ───────
     scan_missed_signals(symbols)
-
-    send_telegram_text(
-        f"🚀 <b>BBMA Bot AKTIF — WebSocket + REST Fallback</b>\n"
-        f"Data: WebSocket realtime, REST hanya saat data kurang\n"
-        f"Sinyal: RE ENTRY · MMT · EXTREME\n"
-        f"TF: 1H · 4H · 1D · 1W — {len(symbols)} simbol\n"
-        f"⏪ Missed signal scan: selesai, mode LIVE dimulai\n"
-        f"🔄 Periodic scan: tiap {PERIODIC_SCAN_INTERVAL//60} menit\n"
-        f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
 
     stop_event  = threading.Event()
     all_threads = []
@@ -1476,6 +1508,25 @@ def main():
     print(f"\n  ✅ Bot aktif — {len(ws_pairs)} koneksi WebSocket")
     print("  Tekan Ctrl+C untuk berhenti.\n")
 
+    # ════════════════════════════════════════════════════════════
+    # NOTIFIKASI 4 — Bot sekarang LIVE
+    # ════════════════════════════════════════════════════════════
+    live_time   = datetime.now()
+    total_boot  = (live_time - boot_time).seconds
+    send_telegram_text(
+        f"🟢 <b>BBMA Bot LIVE — Siap Menerima Sinyal</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 Mode    : WebSocket Realtime\n"
+        f"📋 Simbol  : {len(symbols)} pasang futures aktif\n"
+        f"🕯 TF      : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
+        f"🔔 Sinyal  : RE ENTRY · MMT · EXTREME  (BUY & SELL)\n"
+        f"🔄 Scan    : Tiap {PERIODIC_SCAN_INTERVAL // 60} menit\n"
+        f"📡 WS      : {len(ws_pairs)} koneksi aktif\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 Live sejak : {live_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"⚡ Boot time  : {total_boot} detik"
+    )
+
     try:
         while True:
             time.sleep(10)
@@ -1489,8 +1540,51 @@ def main():
         with _proc_lock:
             state['processed_signals'] = dict(_processed_signals)
         save_state(state)
-        send_telegram_text("⛔ <b>BBMA Bot dihentikan.</b>")
+
+        # ════════════════════════════════════════════════════════
+        # NOTIFIKASI 5 — Bot mati (Ctrl+C / shutdown normal)
+        # ════════════════════════════════════════════════════════
+        uptime_sec = int((datetime.now() - live_time).total_seconds())
+        uptime_str = (
+            f"{uptime_sec // 3600}j "
+            f"{(uptime_sec % 3600) // 60}m "
+            f"{uptime_sec % 60}d"
+        )
+        send_telegram_text(
+            f"🔴 <b>BBMA Bot MATI — Dihentikan Manual</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⛔ Alasan   : Ctrl+C / shutdown normal\n"
+            f"⏱ Uptime   : {uptime_str}\n"
+            f"🕒 Mati     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"💾 State    : Tersimpan ke disk"
+        )
         print("✅ Bot berhenti.")
+
+    except Exception as e:
+        # ════════════════════════════════════════════════════════
+        # NOTIFIKASI 6 — Bot mati karena error tidak terduga
+        # ════════════════════════════════════════════════════════
+        uptime_sec = int((datetime.now() - live_time).total_seconds())
+        uptime_str = (
+            f"{uptime_sec // 3600}j "
+            f"{(uptime_sec % 3600) // 60}m "
+            f"{uptime_sec % 60}d"
+        )
+        stop_event.set()
+        with _proc_lock:
+            state['processed_signals'] = dict(_processed_signals)
+        save_state(state)
+        send_telegram_text(
+            f"💀 <b>BBMA Bot CRASH — Error Tidak Terduga</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ Error    : {str(e)[:300]}\n"
+            f"⏱ Uptime   : {uptime_str}\n"
+            f"🕒 Crash    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"💾 State    : Tersimpan ke disk\n"
+            f"⚠️  Silakan restart bot secara manual."
+        )
+        print(f"💀 Bot crash: {e}")
+        raise
 
 
 if __name__ == "__main__":
