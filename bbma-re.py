@@ -295,11 +295,18 @@ def store_update_candle(symbol: str, tf: str,
                         lo: float, c: float, v: float):
     """
     Update candle di store dari data WebSocket.
-    - Jika timestamp sama dengan candle terakhir → update (candle running)
-    - Jika timestamp lebih baru → append (candle baru)
+    - Jika timestamp sama dengan candle terakhir -> update (candle running)
+    - Jika timestamp lebih baru -> append (candle baru)
     Setelah update tulis ke CSV (di luar lock).
+
+    FIX #1: Bandingkan via integer ms agar tidak ada mismatch timezone/
+    precision antara pd.Timestamp dari WS (ms) vs dari CSV (string).
+    FIX #3: Gunakan df.loc[] bukan df.iloc[-1] = row untuk hindari
+    chained-assignment ValueError di pandas >= 2.0.
     """
-    ts  = pd.Timestamp(ts_ms, unit='ms')
+    ts     = pd.Timestamp(ts_ms, unit='ms')
+    ts_int = ts_ms   # integer ms sebagai kunci perbandingan
+
     row = {'timestamp': ts, 'open': o, 'high': h, 'low': lo,
            'close': c, 'volume': v}
 
@@ -310,15 +317,27 @@ def store_update_candle(symbol: str, tf: str,
         if df is None or df.empty:
             return   # belum di-seed, skip
 
-        last_ts = df.iloc[-1]['timestamp']
-        if ts == last_ts:
-            df.iloc[-1] = row
-        elif ts > last_ts:
+        # Konversi timestamp terakhir ke integer ms untuk perbandingan stabil
+        try:
+            last_ts_int = int(
+                pd.Timestamp(df.iloc[-1]['timestamp']).timestamp() * 1000
+            )
+        except Exception:
+            last_ts_int = 0
+
+        if ts_int == last_ts_int:
+            # Update candle running — pakai .loc agar aman di pandas >= 2.0
+            idx = df.index[-1]
+            for col, val in [('open', o), ('high', h), ('low', lo),
+                              ('close', c), ('volume', v)]:
+                df.loc[idx, col] = val
+        elif ts_int > last_ts_int:
             new_row = pd.DataFrame([row])
             df = pd.concat([df, new_row], ignore_index=True)
             max_rows = TF_SEED_LIMIT.get(tf, 200) + 50
             if len(df) > max_rows:
                 df = df.iloc[-max_rows:].reset_index(drop=True)
+        # ts_int < last_ts_int -> data lama/duplikat dari WS, abaikan
 
         _ohlcv_store.setdefault(symbol, {})[tf] = df
         df_to_save = df.copy()
@@ -787,22 +806,45 @@ _proc_lock = threading.Lock()
 def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
     """
     Dipanggil oleh WebSocket handler setiap kali candle TF close.
-    Alur: cek data lengkap → hitung indikator → scan sinyal → kirim TG.
-    Jika data kurang → minta REST fallback dulu.
+    Alur: cek data lengkap -> hitung indikator -> scan sinyal -> kirim TG.
+    Jika data kurang -> minta REST fallback dulu.
+
+    FIX #2: Saat WS mengirim closed=True, candle yang baru close ada di
+    store[-1]. compute_signals() membaca iloc[-2] sebagai "candle closed
+    terbaru" dan iloc[-1] sebagai "candle running berikutnya".
+    Solusi: tambahkan satu candle placeholder (forward-fill dari candle
+    yang baru close) ke store sebelum compute_signals, lalu hapus setelah
+    selesai. Ini menjaga struktur compute_signals tidak perlu diubah.
     """
     df = store_get(symbol, tf)
 
-    # Data tidak lengkap → REST fallback, lalu coba lagi setelah selesai
+    # Data tidak lengkap -> REST fallback, lalu coba lagi setelah selesai
     if not _is_data_complete(df, tf):
-        print(f"  ⚠️  [{tf.upper()}] {symbol} data kurang "
-              f"({len(df) if df is not None else 0} baris) → REST fallback")
+        print(f"  WARNING [{tf.upper()}] {symbol} data kurang "
+              f"({len(df) if df is not None else 0} baris) -> REST fallback")
         rest_fill_gap(symbol, tf)
         df = store_get(symbol, tf)   # ambil ulang setelah fallback
         if not _is_data_complete(df, tf):
             return   # masih kurang setelah fallback, lewati
 
-    df = add_indicators(df)
-    signals = compute_signals(df)
+    # Tambahkan candle placeholder "running berikutnya" agar compute_signals
+    # dapat membaca iloc[-2] = candle yang baru close dengan benar.
+    # Placeholder: copy OHLCV dari candle terakhir (open = close sebelumnya).
+    dur_sec      = TF_DURATION_SEC.get(tf, 3600)
+    last_row     = df.iloc[-1]
+    placeholder_ts = pd.Timestamp(last_row['timestamp']) + pd.Timedelta(seconds=dur_sec)
+    placeholder  = pd.DataFrame([{
+        'timestamp': placeholder_ts,
+        'open':   float(last_row['close']),
+        'high':   float(last_row['close']),
+        'low':    float(last_row['close']),
+        'close':  float(last_row['close']),
+        'volume': 0.0,
+    }])
+    df_with_placeholder = pd.concat([df, placeholder], ignore_index=True)
+
+    df_ind  = add_indicators(df_with_placeholder)
+    signals = compute_signals(df_ind)
     if not signals:
         return
 
@@ -817,11 +859,12 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
 
         label = SIGNAL_LABEL.get(sig_name, sig_name)
         print(
-            f"  🔔 [{tf.upper()}] {symbol:<22} | "
+            f"  SIGNAL [{tf.upper()}] {symbol:<22} | "
             f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
         )
 
-        img = generate_chart(df, symbol, sig_name, tf)
+        # Chart pakai df asli (tanpa placeholder) agar tidak ada candle palsu
+        img = generate_chart(add_indicators(df), symbol, sig_name, tf)
         send_telegram_alert(
             symbol=symbol, signal_name=sig_name, timeframe=tf,
             data=sig_data, change_24h=change_24h,
@@ -999,6 +1042,10 @@ def _scan_one_symbol_periodic(coin: dict) -> int:
     """
     Scan satu simbol di semua TF untuk sinyal terbaru (candle[-2]).
     Return: jumlah sinyal baru yang dikirim.
+
+    FIX: Sama seperti on_candle_close, tambahkan placeholder candle
+    running agar compute_signals() membaca iloc[-2] = candle closed
+    terbaru dengan benar.
     """
     sym    = coin['symbol']
     change = coin.get('change', 0.0)
@@ -1010,8 +1057,22 @@ def _scan_one_symbol_periodic(coin: dict) -> int:
         if not _is_data_complete(df_raw, tf):
             continue
 
-        df      = add_indicators(df_raw)
-        signals = compute_signals(df)   # selalu scan candle[-2] (closed terbaru)
+        # Tambah placeholder candle running agar iloc[-2] = closed terbaru
+        dur_sec      = TF_DURATION_SEC.get(tf, 3600)
+        last_row     = df_raw.iloc[-1]
+        placeholder_ts = pd.Timestamp(last_row['timestamp']) + pd.Timedelta(seconds=dur_sec)
+        placeholder  = pd.DataFrame([{
+            'timestamp': placeholder_ts,
+            'open':   float(last_row['close']),
+            'high':   float(last_row['close']),
+            'low':    float(last_row['close']),
+            'close':  float(last_row['close']),
+            'volume': 0.0,
+        }])
+        df_with_placeholder = pd.concat([df_raw, placeholder], ignore_index=True)
+
+        df      = add_indicators(df_with_placeholder)
+        signals = compute_signals(df)
         if not signals:
             continue
 
@@ -1027,11 +1088,11 @@ def _scan_one_symbol_periodic(coin: dict) -> int:
 
             label = SIGNAL_LABEL.get(sig_name, sig_name)
             print(
-                f"  🔄 [SCAN {tf.upper()}] {sym:<22} | "
+                f"  SCAN [{tf.upper()}] {sym:<22} | "
                 f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
             )
 
-            img = generate_chart(df, sym, sig_name, tf)
+            img = generate_chart(add_indicators(df_raw), sym, sig_name, tf)
             send_telegram_alert(
                 symbol=sym, signal_name=sig_name, timeframe=tf,
                 data=sig_data, change_24h=change,
@@ -1168,6 +1229,14 @@ class KlineWsConnection:
             with _stream_map_lock:
                 entry = _stream_map.get(key)
             if entry is None:
+                # FIX #4: jangan silent return, log sekali per key baru
+                # agar mudah debug jika ada simbol yang tidak ter-register
+                if not hasattr(self, '_unknown_keys'):
+                    self._unknown_keys = set()
+                if key not in self._unknown_keys:
+                    self._unknown_keys.add(key)
+                    print(f"  [WS-{self.conn_id}] key tidak ditemukan "
+                          f"di stream_map: {key}")
                 return
 
             symbol, tf, change_24h = entry
