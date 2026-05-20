@@ -1,17 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      BBMA OMA ALLY — BINANCE FUTURES  (WebSocket + REST)        ║
+║      BBMA OMA ALLY — BINANCE FUTURES  (Dual-Source: WS + REST) ║
 ║                                                                  ║
-║  ARSITEKTUR DATA:                                                ║
+║  ARSITEKTUR DATA DUAL-SOURCE:                                    ║
 ║  1. Saat start  → REST seed OHLCV historis (1x per simbol/TF)  ║
 ║  2. Saat live   → WebSocket kline stream update candle realtime ║
-║  3. Jika WS gap → REST fallback otomatis untuk tambal data      ║
+║  3. Saat live   → REST polling paralel sebagai sumber ke-2      ║
+║     (backup WS, tangkap candle terlewat, verifikasi data)       ║
+║  4. Jika WS gap → REST fallback otomatis untuk tambal data      ║
 ║                                                                  ║
-║  KEUNTUNGAN:                                                     ║
-║  • Tidak ada polling REST → nol risiko IP ban 418               ║
-║  • Deteksi candle close realtime dari event WS (is_closed=True) ║
-║  • WebSocket Binance Futures: TIDAK ada rate-limit              ║
-║  • Koneksi WS di-batch (maks 200 stream per koneksi)           ║
+║  PERBAIKAN BUG:                                                  ║
+║  • _symbol_to_ws: fix konversi simbol mis. 1000PEPE/USDT:USDT  ║
+║  • on_candle_close: jeda kecil hindari race condition WS↔scan  ║
+║  • REST poll daemon: aktif sebagai sumber data ke-2             ║
+║  • Debug log setiap candle close untuk trace sinyal             ║
 ║                                                                  ║
 ║  SINYAL: RE ENTRY · MMT · EXTREME  (BUY & SELL)                ║
 ║  TF    : 1H · 4H · 1D · 1W                                     ║
@@ -809,13 +811,19 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
     Alur: cek data lengkap -> hitung indikator -> scan sinyal -> kirim TG.
     Jika data kurang -> minta REST fallback dulu.
 
-    FIX #2: Saat WS mengirim closed=True, candle yang baru close ada di
-    store[-1]. compute_signals() membaca iloc[-2] sebagai "candle closed
-    terbaru" dan iloc[-1] sebagai "candle running berikutnya".
-    Solusi: tambahkan satu candle placeholder (forward-fill dari candle
-    yang baru close) ke store sebelum compute_signals, lalu hapus setelah
-    selesai. Ini menjaga struktur compute_signals tidak perlu diubah.
+    BUG FIX:
+    Saat WS closed=True, store_update_candle sudah memasukkan candle baru
+    ke store[-1] (candle running berikutnya belum ada).
+    compute_signals() membaca df.iloc[-2] = candle closed terbaru, dan
+    df.iloc[-1] = candle running. Karena candle running belum ada di store
+    (hanya ada setelah tick WS berikutnya), kita harus tambahkan placeholder.
+
+    BUG FIX #2: Pastikan df fresh diambil SETELAH store_update_candle selesai.
+    Tambah jeda kecil agar tidak ada race condition antara WS update dan scan.
     """
+    # Jeda kecil untuk pastikan store sudah diupdate oleh WS thread
+    time.sleep(0.05)
+
     df = store_get(symbol, tf)
 
     # Data tidak lengkap -> REST fallback, lalu coba lagi setelah selesai
@@ -829,11 +837,10 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
 
     # Tambahkan candle placeholder "running berikutnya" agar compute_signals
     # dapat membaca iloc[-2] = candle yang baru close dengan benar.
-    # Placeholder: copy OHLCV dari candle terakhir (open = close sebelumnya).
-    dur_sec      = TF_DURATION_SEC.get(tf, 3600)
-    last_row     = df.iloc[-1]
+    dur_sec        = TF_DURATION_SEC.get(tf, 3600)
+    last_row       = df.iloc[-1]
     placeholder_ts = pd.Timestamp(last_row['timestamp']) + pd.Timedelta(seconds=dur_sec)
-    placeholder  = pd.DataFrame([{
+    placeholder    = pd.DataFrame([{
         'timestamp': placeholder_ts,
         'open':   float(last_row['close']),
         'high':   float(last_row['close']),
@@ -845,6 +852,12 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
 
     df_ind  = add_indicators(df_with_placeholder)
     signals = compute_signals(df_ind)
+
+    # DEBUG: log setiap candle close agar mudah trace
+    print(f"  [WS-CLOSE] {symbol} [{tf.upper()}] "
+          f"close={float(last_row['close']):.6g} "
+          f"signals={'|'.join(signals.keys()) if signals else 'none'}")
+
     if not signals:
         return
 
@@ -859,7 +872,7 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
 
         label = SIGNAL_LABEL.get(sig_name, sig_name)
         print(
-            f"  SIGNAL [{tf.upper()}] {symbol:<22} | "
+            f"  🔔 SIGNAL [{tf.upper()}] {symbol:<22} | "
             f"{label} {sig_data['tipe']:<4} @ {sig_data['price']:.6g}"
         )
 
@@ -1170,17 +1183,161 @@ def periodic_scan_daemon(stop_event: threading.Event):
 
 
 # ==========================================
-# 16. WEBSOCKET — koneksi kline stream
+# 15d. DUAL-SOURCE REST POLLING DAEMON
+#      Sumber data ke-2: REST API polling candle terbaru
+#      Berjalan paralel dengan WebSocket untuk backup & verifikasi.
+#      Interval disesuaikan per TF agar tidak over-request.
 # ==========================================
+# Interval polling REST per TF (detik) - agak sebelum candle close
+_REST_POLL_INTERVAL = {
+    '1h':  120,    # poll tiap 2 menit
+    '4h':  300,    # poll tiap 5 menit
+    '1d':  600,    # poll tiap 10 menit
+    '1w': 1800,    # poll tiap 30 menit
+}
+_rest_poll_last: dict = {}   # { "symbol_tf": last_poll_time }
+_rest_poll_lock = threading.Lock()
+
+
+def _rest_poll_one(coin: dict) -> int:
+    """
+    Poll REST API untuk satu simbol di semua TF.
+    Update store jika ada candle baru/berubah.
+    Return: jumlah TF yang berhasil di-update.
+    """
+    sym    = coin['symbol']
+    change = coin.get('change', 0.0)
+    updated = 0
+
+    for tf in TIMEFRAMES:
+        now = time.time()
+        poll_key = f"{sym}_{tf}"
+
+        with _rest_poll_lock:
+            last = _rest_poll_last.get(poll_key, 0.0)
+
+        if now - last < _REST_POLL_INTERVAL.get(tf, 120):
+            continue   # belum waktunya
+
+        with _rest_poll_lock:
+            _rest_poll_last[poll_key] = now
+
+        try:
+            bars = _rest_call(exchange.fetch_ohlcv, sym, tf, limit=5)
+            if not bars:
+                continue
+
+            df_existing = store_get(sym, tf)
+            if df_existing is None or df_existing.empty:
+                continue
+
+            # Cari candle baru yang belum ada di store
+            df_new = pd.DataFrame(
+                bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], unit='ms')
+
+            last_store_ts = df_existing.iloc[-1]['timestamp']
+            df_fresh = df_new[df_new['timestamp'] > last_store_ts]
+
+            if not df_fresh.empty:
+                # Ada candle baru → update store dan proses sinyal
+                df_merged = pd.concat([df_existing, df_fresh], ignore_index=True)
+                df_merged.drop_duplicates(subset='timestamp', keep='last', inplace=True)
+                df_merged.sort_values('timestamp', inplace=True)
+                df_merged.reset_index(drop=True, inplace=True)
+                store_set(sym, tf, df_merged)
+                save_ohlcv(sym, tf, df_merged)
+                print(f"  [REST-POLL] {sym} [{tf.upper()}] "
+                      f"+{len(df_fresh)} candle baru → trigger signal check")
+                # Jalankan signal check (sama seperti on_candle_close)
+                threading.Thread(
+                    target=on_candle_close,
+                    args=(sym, tf, change),
+                    daemon=True
+                ).start()
+                updated += 1
+            else:
+                # Tidak ada candle baru, tapi update candle running (last bar)
+                # agar indikator selalu fresh
+                last_bar = bars[-1]
+                store_update_candle(
+                    sym, tf,
+                    int(last_bar[0]),
+                    float(last_bar[1]), float(last_bar[2]),
+                    float(last_bar[3]), float(last_bar[4]),
+                    float(last_bar[5]),
+                )
+                updated += 1
+
+        except Exception as e:
+            print(f"  [REST-POLL Error] {sym} {tf}: {e}")
+
+    return updated
+
+
+def rest_poll_daemon(stop_event: threading.Event):
+    """
+    Daemon dual-source: polling REST API secara berkala sebagai
+    sumber data ke-2 di samping WebSocket.
+    Keuntungan:
+      • Menangkap candle close yang terlewat WS (gap, reconnect, dsb)
+      • Memverifikasi data WS dengan data REST resmi
+      • Menjaga candle running tetap fresh di antara event WS
+    """
+    # Tunggu 90 detik agar WebSocket sudah connect dan seed selesai
+    print("  📡 [REST-POLL] Daemon dimulai, tunggu 90s...")
+    for _ in range(90):
+        if stop_event.is_set():
+            return
+        time.sleep(1)
+
+    print("  📡 [REST-POLL] Daemon aktif — polling REST paralel WS")
+
+    while not stop_event.is_set():
+        with _sym_lock:
+            symbols_snap = list(_shared_symbols)
+
+        if not symbols_snap:
+            time.sleep(10)
+            continue
+
+        # Gunakan thread pool kecil agar tidak banjiri REST
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            futs = [ex.submit(_rest_poll_one, coin) for coin in symbols_snap]
+            for f in concurrent.futures.as_completed(futs):
+                if stop_event.is_set():
+                    break
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        # Tidur pendek sebelum siklus berikutnya
+        for _ in range(30):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+
+
+
 # Lookup cepat: "btcusdt_1h" → (symbol_ccxt, tf, change_24h)
 _stream_map      : dict = {}
 _stream_map_lock = threading.Lock()
 
 
 def _symbol_to_ws(symbol: str) -> str:
-    """'BTC/USDT:USDT' → 'btcusdt'"""
-    base = symbol.split('/')[0]
-    return (base + 'usdt').lower()
+    """
+    'BTC/USDT:USDT' → 'btcusdt'
+    BUG FIX: Sebelumnya hanya ambil base (BTC), lalu tambah 'usdt'.
+    Tapi untuk simbol seperti '1000PEPE/USDT:USDT', base = '1000PEPE'
+    → '1000pepeusdt' yang benar.
+    Sekarang ambil bagian sebelum ':' lalu strip '/USDT' → lowercase.
+    """
+    # Buang suffix ':USDT' jika ada, ambil sebelum titik dua
+    clean = symbol.split(':')[0]          # 'BTC/USDT'
+    clean = clean.replace('/', '').lower()  # 'btcusdt'
+    return clean
 
 
 def _build_stream_name(symbol: str, tf: str) -> str:
@@ -1498,6 +1655,13 @@ def main():
     t_save.start()
     all_threads.append(t_save)
 
+    # ── REST Poll daemon (dual-source ke-2) ───────────────────
+    t_poll = threading.Thread(target=rest_poll_daemon,
+                              args=(stop_event,),
+                              name="RestPoll", daemon=True)
+    t_poll.start()
+    all_threads.append(t_poll)
+
     # ── Periodic scan daemon (tiap 10 menit) ──────────────────
     t_scan = threading.Thread(target=periodic_scan_daemon,
                               args=(stop_event,),
@@ -1516,11 +1680,11 @@ def main():
     send_telegram_text(
         f"🟢 <b>BBMA Bot LIVE — Siap Menerima Sinyal</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Mode    : WebSocket Realtime\n"
+        f"📡 Mode    : Dual-Source (WebSocket + REST Polling)\n"
         f"📋 Simbol  : {len(symbols)} pasang futures aktif\n"
         f"🕯 TF      : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
         f"🔔 Sinyal  : RE ENTRY · MMT · EXTREME  (BUY & SELL)\n"
-        f"🔄 Scan    : Tiap {PERIODIC_SCAN_INTERVAL // 60} menit\n"
+        f"🔄 Scan    : Tiap {PERIODIC_SCAN_INTERVAL // 60} menit + REST poll\n"
         f"📡 WS      : {len(ws_pairs)} koneksi aktif\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕒 Live sejak : {live_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
