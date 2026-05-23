@@ -1180,6 +1180,12 @@ def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
         return None
 
 
+# ==========================================
+# 14. TELEGRAM
+# ==========================================
+_tg_lock = threading.Lock()
+
+
 def send_telegram_photo(text: str, image_path: 'str | None' = None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -1210,11 +1216,6 @@ def send_telegram_photo(text: str, image_path: 'str | None' = None):
                 )
         except Exception as e:
             print(f"  [TG Photo Error] {e}")
-
-# ==========================================
-# 14. TELEGRAM
-# ==========================================
-_tg_lock = threading.Lock()
 
 
 def _format_mtf_block(mtf: dict) -> str:
@@ -1815,6 +1816,52 @@ def state_save_daemon(state: dict, stop_event: threading.Event):
         save_state(state)
 
 # ==========================================
+# 18b. DAEMON — heartbeat Telegram tiap 1 jam
+#      Kirim status "Bot masih LIVE" ke Telegram agar
+#      operator tahu bot masih berjalan normal.
+# ==========================================
+HEARTBEAT_INTERVAL = 3600   # detik — kirim status tiap 1 jam
+
+def heartbeat_daemon(start_time: datetime, ws_pairs: list,
+                     symbols: list, stop_event: threading.Event):
+    """
+    Kirim pesan heartbeat ke Telegram tiap HEARTBEAT_INTERVAL detik.
+    Tujuan: operator tahu bot masih aktif tanpa perlu cek manual.
+    """
+    while not stop_event.is_set():
+        # Tunggu interval (pecah kecil agar bisa detect stop_event cepat)
+        for _ in range(HEARTBEAT_INTERVAL):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+
+        now        = datetime.now()
+        uptime_sec = int((now - start_time).total_seconds())
+        uptime_str = (
+            f"{uptime_sec // 3600}j "
+            f"{(uptime_sec % 3600) // 60}m "
+            f"{uptime_sec % 60}d"
+        )
+        with _proc_lock:
+            total_sigs = len(_processed_signals)
+
+        send_telegram_photo(
+            f"💚 <b>BBMA Bot — MASIH AKTIF (Heartbeat)</b>\n"
+            f"──────────────────────\n"
+            f"🟢 Status      : Bot berjalan normal\n"
+            f"⏱ Uptime       : <b>{uptime_str}</b>\n"
+            f"🕐 Waktu check : {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"──────────────────────\n"
+            f"💎 Simbol pantau: {len(symbols)} koin\n"
+            f"📡 WebSocket   : {len(ws_pairs)} koneksi aktif\n"
+            f"🧵 Threads     : {threading.active_count()} berjalan\n"
+            f"📊 Total sinyal: {total_sigs} sinyal tercatat\n"
+            f"──────────────────────\n"
+            f"<i>⏰ Update berikutnya dalam {HEARTBEAT_INTERVAL // 60} menit</i>"
+        )
+        _info(f"Heartbeat Telegram terkirim — uptime {uptime_str}")
+
+# ==========================================
 # 19. MAIN
 # ==========================================
 def main():
@@ -1949,6 +1996,13 @@ def main():
     t_scan.start()
     all_threads.append(t_scan)
 
+    # ── Heartbeat daemon — kirim status ke Telegram tiap 1 jam ───
+    t_hb = threading.Thread(target=heartbeat_daemon,
+                             args=(_start_time, ws_pairs, symbols, stop_event),
+                             name="Heartbeat", daemon=True)
+    t_hb.start()
+    all_threads.append(t_hb)
+
     _live_time   = datetime.now()
     _total_init  = (_live_time - _start_time).seconds
 
@@ -1960,6 +2014,7 @@ def main():
     print(f"  {C.GRAY}Sumber 1 : {C.GREEN}WebSocket{C.GRAY} — candle close realtime{C.RESET}")
     print(f"  {C.GRAY}Sumber 2 : {C.BLUE}REST Poll{C.GRAY} — tiap {REST_POLL_INTERVAL//60} menit, ambil {REST_POLL_CANDLES} candle/TF{C.RESET}")
     print(f"  {C.GRAY}Backup   : {C.CYAN}Periodic Scan{C.GRAY} tiap {PERIODIC_SCAN_INTERVAL//60} menit{C.RESET}")
+    print(f"  {C.GRAY}Heartbeat: {C.MAGENTA}Telegram{C.GRAY} tiap {HEARTBEAT_INTERVAL//60} menit{C.RESET}")
     print(f"  {C.GRAY}Stop     : Ctrl+C untuk berhenti{C.RESET}")
     print(_sep('═'))
     print()
@@ -1969,25 +2024,27 @@ def main():
 
     _chart_live = generate_status_chart(label='BOT_LIVE')
     send_telegram_photo(
-        f"🟢 <b>BBMA Bot LIVE — Dual-Source Aktif!</b>\n"
-        f"══════════════════════\n"
-        f"💎 Simbol      : <b>{len(symbols)}</b> koin (Top-{TOP_N} by OI)\n"
-        f"📊 Timeframe   : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
-        f"🎯 Sinyal      : RE ENTRY · MMT · EXTREME\n"
-        f"──────────────────────\n"
-        f"📡 Sumber 1    : WebSocket ({len(ws_pairs)} koneksi)\n"
-        f"🔗 Sumber 2    : REST Poll (tiap {REST_POLL_INTERVAL//60} menit)\n"
-        f"🔍 Backup scan : Tiap {PERIODIC_SCAN_INTERVAL//60} menit\n"
-        f"──────────────────────\n"
-        f"⏰ Start       : {_start_time.strftime('%H:%M:%S')}\n"
-        f"🚀 LIVE sejak  : {_live_time.strftime('%H:%M:%S')}\n"
-        f"⏱ Init selesai: {_total_init} detik\n"
-        f"──────────────────────\n"
-        f"🛠 Bug Fixes   : Race Condition · Indikator · Indexing · Dual-Source\n"
-        f"✅ <b>Bot aktif memantau sinyal dari 2 sumber data.</b>\n"
-        f"📩 Sinyal dikirim otomatis ke sini.",
+        f"\U0001f7e2 <b>BBMA Bot SEKARANG LIVE!</b>\n"
+        f"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n"
+        f"\U0001f48e Simbol      : <b>{len(symbols)}</b> koin (Top-{TOP_N} by OI)\n"
+        f"\U0001f4ca Timeframe   : {' \u00b7 '.join(tf.upper() for tf in TIMEFRAMES)}\n"
+        f"\U0001f3af Sinyal      : RE ENTRY \u00b7 MMT \u00b7 EXTREME\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\U0001f4e1 Sumber 1    : WebSocket ({len(ws_pairs)} koneksi aktif)\n"
+        f"\U0001f517 Sumber 2    : REST Poll (tiap {REST_POLL_INTERVAL//60} menit)\n"
+        f"\U0001f50d Backup scan : Tiap {PERIODIC_SCAN_INTERVAL//60} menit\n"
+        f"\U0001f49a Heartbeat   : Status dikirim tiap {HEARTBEAT_INTERVAL//60} menit\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u23f0 Start       : {_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"\U0001f680 LIVE sejak  : {_live_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"\u23f1 Init selesai: {_total_init} detik\n"
+        f"\U0001f9f5 Threads     : {threading.active_count()} aktif\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u2705 <b>Bot aktif memantau sinyal dari 2 sumber data.</b>\n"
+        f"\U0001f4e9 Sinyal & status dikirim otomatis ke sini.",
         image_path=_chart_live,
     )
+
 
     try:
         while True:
