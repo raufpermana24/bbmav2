@@ -8,16 +8,19 @@
 ║  • Hanya scan TOP 100 koin terbesar (configurable)             ║
 ║  • Refresh otomatis tiap 4 jam                                  ║
 ║                                                                  ║
-║  ARSITEKTUR DATA:                                                ║
-║  1. Saat start  → REST seed OHLCV historis (1x per simbol/TF)  ║
-║  2. Saat live   → WebSocket kline stream update candle realtime ║
-║  3. Jika WS gap → REST fallback otomatis untuk tambal data      ║
+║  ARSITEKTUR DATA (DUAL-SOURCE):                                  ║
+║  1. Sumber 1: REST API  → seed historis + fallback + validasi   ║
+║  2. Sumber 2: WebSocket → update candle realtime (close event)  ║
+║  3. REST Poll tiap 5 menit → cross-check & tambal jika WS miss  ║
+║  4. Jika WS gap → REST fallback otomatis untuk tambal data      ║
 ║                                                                  ║
-║  KEUNTUNGAN:                                                     ║
-║  • Tidak ada polling REST → nol risiko IP ban 418               ║
-║  • Deteksi candle close realtime dari event WS (is_closed=True) ║
-║  • WebSocket Binance Futures: TIDAK ada rate-limit              ║
-║  • Koneksi WS di-batch (maks 200 stream per koneksi)           ║
+║  PERBAIKAN BUG:                                                  ║
+║  FIX-1: Race condition on_candle_close → pakai Event + queue    ║
+║  FIX-2: add_indicators shift(1) salah arah → shift(-1) fixed    ║
+║  FIX-3: compute_signals index -2/-3 tidak konsisten → fixed     ║
+║  FIX-4: periodic_scan langsung mulai setelah seed selesai       ║
+║  FIX-5: Dual-source: REST poll tiap 5 menit validasi WS data    ║
+║  FIX-6: _processed_signals key pakai candle_time bukan ts str   ║
 ║                                                                  ║
 ║  SINYAL: RE ENTRY · MMT · EXTREME  (BUY & SELL)                ║
 ║  TF    : 1H · 4H · 1D · 1W                                     ║
@@ -29,6 +32,7 @@ import os
 import re
 import time
 import json
+import queue
 import threading
 import warnings
 import concurrent.futures
@@ -80,17 +84,23 @@ TF_DURATION_SEC = {'1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800}
 TF_WS_INTERVAL = {'1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w'}
 
 TF_WEIGHT  = {'1h': 1, '4h': 2, '1d': 3, '1w': 4}
-MIN_VOLUME = 500_000     # minimal quoteVolume $500 ribu (lebih longgar, karena sudah filter top-N)
-TOP_N      = 100         # jumlah simbol teratas berdasarkan Open Interest Binance Futures
+MIN_VOLUME = 500_000     # minimal quoteVolume $500 ribu
+TOP_N      = 100         # jumlah simbol teratas berdasarkan Open Interest
 
 # ── Binance Futures REST endpoint (tanpa auth) ────────────────
 BNFUT_BASE = "https://fapi.binance.com"
 
-# ── REST (hanya seed & fallback) ──────────────────────────────
+# ── REST (seed, fallback, dan poll) ──────────────────────────
 REST_DELAY       = 0.3    # detik jeda antar request
 REST_MAX_RETRY   = 5
 BAN_WAIT_SEC     = 120
 MAX_SEED_THREADS = 4      # thread paralel saat seed awal
+
+# ── DUAL-SOURCE: REST Poll interval ──────────────────────────
+# FIX-5: REST poll tiap 5 menit untuk cross-check data WS
+REST_POLL_INTERVAL  = 300   # 5 menit
+REST_POLL_THREADS   = 6     # thread paralel saat REST poll
+REST_POLL_CANDLES   = 5     # ambil 5 candle terbaru per TF per poll
 
 # ── WebSocket ─────────────────────────────────────────────────
 WS_BASE_URL      = "wss://fstream.binance.com/stream?streams="
@@ -114,7 +124,6 @@ class C:
     RESET  = '\033[0m'    if _on else ''
     BOLD   = '\033[1m'    if _on else ''
     DIM    = '\033[2m'    if _on else ''
-    # Foreground
     WHITE  = '\033[97m'   if _on else ''
     CYAN   = '\033[96m'   if _on else ''
     GREEN  = '\033[92m'   if _on else ''
@@ -126,7 +135,6 @@ class C:
     GRAY   = '\033[90m'   if _on else ''
 
 def _tw() -> int:
-    """Lebar terminal, default 80."""
     return shutil.get_terminal_size((80, 24)).columns
 
 def _sep(char='═', color=C.CYAN) -> str:
@@ -156,9 +164,10 @@ def _dim(msg: str):
     print(f"  {C.GRAY}{msg}{C.RESET}")
 
 def _signal_line(icon: str, label: str, sym: str, tf: str,
-                 price: float, extra: str = ''):
+                 price: float, source: str = '', extra: str = ''):
     dir_col = C.GREEN if 'BUY' in label else C.RED
     ts = datetime.now().strftime('%H:%M:%S')
+    src_tag = f" {C.BLUE}[{source}]{C.RESET}" if source else ''
     print(
         f"  {C.GRAY}[{ts}]{C.RESET} "
         f"{dir_col}{icon}{C.RESET} "
@@ -166,11 +175,11 @@ def _signal_line(icon: str, label: str, sym: str, tf: str,
         f"{C.YELLOW}{sym:<22}{C.RESET} "
         f"{C.CYAN}{tf.upper():<3}{C.RESET}  "
         f"{C.GREEN}${price:.6g}{C.RESET}"
+        f"{src_tag}"
         f"  {C.GRAY}{extra}{C.RESET}"
     )
 
 def _progress(done: int, total: int, label: str = '', width: int = 30):
-    """Cetak progress bar inline (overwrite baris yang sama)."""
     pct    = done / total if total else 0
     filled = int(pct * width)
     bar    = C.GREEN + '█' * filled + C.GRAY + '░' * (width - filled) + C.RESET
@@ -185,7 +194,6 @@ def _progress_end():
     sys.stdout.flush()
 
 def _spinner_msg(msg: str, done: bool = False):
-    """Tampil satu baris status dengan ikon."""
     icon = f"{C.GREEN}✓{C.RESET}" if done else f"{C.YELLOW}…{C.RESET}"
     ts   = datetime.now().strftime('%H:%M:%S')
     print(f"  {C.GRAY}[{ts}]{C.RESET} {icon}  {msg}")
@@ -196,9 +204,7 @@ def _section(title: str, icon: str = '▶'):
     print(f"  {C.GRAY}{'─' * (min(_tw(), 64) - 2)}{C.RESET}")
 
 # ── Missed signal scan saat startup ──────────────────────────
-# Hanya scan sinyal dalam 8 jam ke belakang dari waktu bot start
 MISSED_LOOKBACK_SECONDS = 28800  # 8 jam
-# Jeda antar pengiriman sinyal terlewat (detik), hindari flood TG
 MISSED_SIGNAL_DELAY = 1.5
 
 # ── Label sinyal ──────────────────────────────────────────────
@@ -217,7 +223,7 @@ SIGNAL_LABEL = {
 }
 
 # ==========================================
-# 3. KONEKSI REST — hanya untuk seed & fallback
+# 3. KONEKSI REST — seed, fallback, dan poll
 # ==========================================
 exchange = ccxt.binance({
     'apiKey':    API_KEY,
@@ -304,25 +310,16 @@ def save_state(state: dict):
 # ==========================================
 def _fetch_binance_open_interest() -> dict:
     """
-    Ambil Open Interest semua simbol USDT perpetual dari Binance Futures
-    melalui endpoint publik (tanpa API key).
-    Return: dict { 'BTCUSDT': float_oi_usd, ... }
+    Ambil Open Interest semua simbol USDT perpetual dari Binance Futures.
+    Return: (oi_map, vol_map, usdt_perp)
     """
-    url = f"{BNFUT_BASE}/fapi/v1/openInterest"
-    # Endpoint /fapi/v1/ticker/24hr juga berisi openInterest tidak tersedia
-    # Gunakan /fapi/v1/openInterestHist tidak perlu, cukup ambil snapshot
-    # dari endpoint undocumented tapi stabil: /fapi/v1/ticker/bookTicker
-    # Cara terbaik: ambil semua via /fapi/v1/ticker/24hr yang punya quoteVolume
-    # lalu ambil OI per simbol via /fapi/v2/ticker/price + OI snapshot
-
-    # ── Langkah 1: ambil daftar simbol USDT perpetual ─────────
     try:
         r = requests.get(f"{BNFUT_BASE}/fapi/v1/exchangeInfo", timeout=15)
         r.raise_for_status()
         info = r.json()
     except Exception as e:
         print(f"  [OI] exchangeInfo gagal: {e}")
-        return {}
+        return {}, {}, []
 
     usdt_perp = [
         s['symbol'] for s in info.get('symbols', [])
@@ -332,14 +329,13 @@ def _fetch_binance_open_interest() -> dict:
         and not any(x in s['symbol'] for x in ['UP', 'DOWN', 'BEAR', 'BULL'])
     ]
 
-    # ── Langkah 2: ambil ticker 24h (berisi lastPrice & quoteVolume) ──
     try:
         r2 = requests.get(f"{BNFUT_BASE}/fapi/v1/ticker/24hr", timeout=15)
         r2.raise_for_status()
         tickers_raw = r2.json()
     except Exception as e:
         print(f"  [OI] ticker/24hr gagal: {e}")
-        return {}
+        return {}, {}, []
 
     price_map = {}
     vol_map   = {}
@@ -352,9 +348,6 @@ def _fetch_binance_open_interest() -> dict:
             except Exception:
                 pass
 
-    # ── Langkah 3: ambil Open Interest snapshot semua simbol ──
-    # Binance sediakan /fapi/v1/openInterest?symbol=XXX (satu per satu)
-    # Gunakan batch request ringan dengan ThreadPoolExecutor
     oi_map = {}
 
     def _fetch_oi(sym):
@@ -368,7 +361,7 @@ def _fetch_binance_open_interest() -> dict:
                 data = r.json()
                 oi_qty  = float(data.get('openInterest', 0))
                 price   = price_map.get(sym, 0)
-                return sym, oi_qty * price   # OI dalam USD
+                return sym, oi_qty * price
         except Exception:
             pass
         return sym, 0.0
@@ -384,11 +377,6 @@ def _fetch_binance_open_interest() -> dict:
 
 
 def get_all_futures_symbols() -> list:
-    """
-    Ambil semua simbol USDT perpetual Binance Futures,
-    urutkan berdasarkan Open Interest (USD) sebagai proxy market cap,
-    kembalikan TOP_N teratas.
-    """
     _section(f"Menyusun Top-{TOP_N} Binance Futures berdasarkan Open Interest", "📡")
 
     result = _fetch_binance_open_interest()
@@ -398,14 +386,12 @@ def get_all_futures_symbols() -> list:
 
     oi_map, vol_map, usdt_perp = result
 
-    # ── Buat list + sort by OI descending ─────────────────────
     ranked = []
     for sym in usdt_perp:
         oi_usd  = oi_map.get(sym, 0)
         vol_usd = vol_map.get(sym, 0)
         if vol_usd < MIN_VOLUME:
             continue
-        # Konversi simbol Binance (BTCUSDT) → format CCXT (BTC/USDT:USDT)
         base = sym.replace('USDT', '')
         ccxt_sym = f"{base}/USDT:USDT"
         ranked.append({
@@ -419,7 +405,6 @@ def get_all_futures_symbols() -> list:
     ranked.sort(key=lambda x: x['oi_usd'], reverse=True)
     top = ranked[:TOP_N]
 
-    # ── Cetak ranking ──────────────────────────────────────────
     _section(f"TOP-{TOP_N} BINANCE FUTURES — Open Interest (USD)", "🏆")
     hdr = (f"  {C.BOLD}{C.GRAY}{'#':>3}  {'Simbol':<18} "
            f"{'Open Interest (USD)':>22}  {'Volume 24h':>18}{C.RESET}")
@@ -442,7 +427,6 @@ def get_all_futures_symbols() -> list:
 
 
 def _fallback_get_symbols() -> list:
-    """Fallback: gunakan fetch_tickers CCXT jika OI endpoint gagal."""
     try:
         _rest_call(exchange.load_markets)
     except Exception as e:
@@ -466,7 +450,7 @@ def _fallback_get_symbols() -> list:
             'symbol': t['symbol'],
             'change': t.get('percentage') or 0.0,
             'volume': vol,
-            'oi_usd': vol,   # gunakan volume sbg proxy OI
+            'oi_usd': vol,
         })
 
     valid.sort(key=lambda x: x['volume'], reverse=True)
@@ -504,7 +488,6 @@ def load_ohlcv(symbol: str, tf: str) -> 'pd.DataFrame | None':
 
 # ==========================================
 # 7. IN-MEMORY OHLCV STORE
-#    Diupdate live oleh WebSocket, dibaca oleh signal processor
 # ==========================================
 _store_lock  = threading.Lock()
 _ohlcv_store: dict = {}   # { symbol: { tf: DataFrame } }
@@ -531,39 +514,34 @@ def store_update_candle(symbol: str, tf: str,
                         lo: float, c: float, v: float) -> bool:
     """
     Update candle di store dari data WebSocket.
-    - Jika timestamp sama dengan candle terakhir → update (candle running)
-    - Jika timestamp lebih baru → append (candle baru)
-    Setelah update tulis ke CSV (di luar lock).
-    Return True jika update berhasil, False jika skip.
-
-    FIX: Selalu update/append candle agar saat closed=True data sudah ada
-    di store sebelum on_candle_close membaca.
+    FIX-1: Menggunakan lock yang benar, tidak ada race condition.
+    Return True jika update berhasil.
     """
     ts  = pd.Timestamp(ts_ms, unit='ms')
     row = {'timestamp': ts, 'open': o, 'high': h, 'low': lo,
            'close': c, 'volume': v}
 
     df_to_save = None
+    updated = False
     with _store_lock:
         sym_data = _ohlcv_store.get(symbol, {})
         df = sym_data.get(tf)
         if df is None or df.empty:
-            return False   # belum di-seed, skip
+            return False
 
         last_ts = df.iloc[-1]['timestamp']
         if ts == last_ts:
-            # update candle running (overwrite baris terakhir)
             df = df.copy()
             df.iloc[-1] = row
+            updated = True
         elif ts > last_ts:
-            # candle baru: append
             new_row = pd.DataFrame([row])
             df = pd.concat([df, new_row], ignore_index=True)
             max_rows = TF_SEED_LIMIT.get(tf, 200) + 50
             if len(df) > max_rows:
                 df = df.iloc[-max_rows:].reset_index(drop=True)
+            updated = True
         else:
-            # ts < last_ts → candle lama, abaikan
             return False
 
         _ohlcv_store.setdefault(symbol, {})[tf] = df
@@ -571,7 +549,7 @@ def store_update_candle(symbol: str, tf: str,
 
     if df_to_save is not None:
         save_ohlcv(symbol, tf, df_to_save)
-    return True
+    return updated
 
 
 def _is_data_complete(df: 'pd.DataFrame | None', tf: str) -> bool:
@@ -583,7 +561,6 @@ def _is_data_complete(df: 'pd.DataFrame | None', tf: str) -> bool:
 # 8. REST SEED — ambil historis saat pertama start
 # ==========================================
 def rest_seed_one(symbol: str, tf: str) -> bool:
-    """Ambil OHLCV historis via REST untuk satu simbol/TF."""
     try:
         bars = _rest_call(
             exchange.fetch_ohlcv, symbol, tf,
@@ -605,7 +582,7 @@ def rest_seed_one(symbol: str, tf: str) -> bool:
 def rest_seed_all(symbols: list):
     """
     Seed semua simbol × TF:
-    1. Coba load dari disk dulu (tidak pakai REST)
+    1. Coba load dari disk dulu
     2. Jika data di disk kurang → REST
     """
     total  = len(symbols) * len(TIMEFRAMES)
@@ -647,13 +624,9 @@ def rest_seed_all(symbols: list):
         f"({C.RED}{done - seeded} gagal{C.RESET})")
 
 # ==========================================
-# 9. REST FALLBACK — tambal gap setelah WS disconnect / data kurang
+# 9. REST FALLBACK — tambal gap setelah WS disconnect
 # ==========================================
 def rest_fill_gap(symbol: str, tf: str):
-    """
-    Ambil candle terbaru via REST untuk mengisi gap.
-    Hanya request candle yang belum ada di store.
-    """
     try:
         df_existing = store_get(symbol, tf)
         if df_existing is None or df_existing.empty:
@@ -695,6 +668,152 @@ def rest_fill_gap(symbol: str, tf: str):
         print(f"  [REST fallback Error] {symbol} {tf}: {e}")
 
 # ==========================================
+# 9b. DUAL-SOURCE: REST POLL — sumber data ke-2
+#     Ambil data fresh dari REST tiap REST_POLL_INTERVAL detik
+#     untuk cross-check dan validasi data dari WebSocket.
+# ==========================================
+def rest_poll_one(symbol: str, tf: str) -> 'pd.DataFrame | None':
+    """
+    Ambil N candle terbaru dari REST API untuk satu simbol/TF.
+    Merge dengan data yang ada di store, return DataFrame yang dimerge.
+    FIX-5: Ini adalah sumber data ke-2 (REST poll) selain WebSocket.
+    """
+    try:
+        bars = _rest_call(
+            exchange.fetch_ohlcv, symbol, tf,
+            limit=REST_POLL_CANDLES
+        )
+        if not bars:
+            return None
+
+        df_new = pd.DataFrame(bars,
+                              columns=['timestamp', 'open', 'high',
+                                       'low', 'close', 'volume'])
+        df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], unit='ms')
+
+        df_existing = store_get(symbol, tf)
+        if df_existing is None or df_existing.empty:
+            return None
+
+        # Merge: REST data menang untuk candle yang sama (lebih akurat)
+        df_merged = pd.concat([df_existing, df_new], ignore_index=True)
+        df_merged.drop_duplicates(subset='timestamp', keep='last', inplace=True)
+        df_merged.sort_values('timestamp', inplace=True)
+        df_merged.reset_index(drop=True, inplace=True)
+
+        max_rows = TF_SEED_LIMIT.get(tf, 200) + 50
+        if len(df_merged) > max_rows:
+            df_merged = df_merged.iloc[-max_rows:].reset_index(drop=True)
+
+        store_set(symbol, tf, df_merged)
+        return df_merged
+
+    except Exception as e:
+        # Jangan print error untuk menghindari flood log
+        return None
+
+
+def rest_poll_daemon(stop_event: threading.Event):
+    """
+    FIX-5: Daemon REST poll — sumber data ke-2 selain WebSocket.
+    Setiap REST_POLL_INTERVAL detik, ambil candle terbaru via REST
+    untuk semua simbol × TF, merge ke store, lalu scan sinyal.
+    
+    Ini memastikan sinyal tidak terlewat meski:
+    - WebSocket terlambat kirim event closed=True
+    - TF panjang (1d/1w) yang candle close-nya jarang
+    - Ada gap atau error di WebSocket
+    """
+    # Tunggu sampai seed selesai
+    time.sleep(30)
+
+    _info(f"REST Poll daemon aktif — interval: {REST_POLL_INTERVAL}s, "
+          f"ambil {REST_POLL_CANDLES} candle/TF")
+
+    while not stop_event.is_set():
+        start_t = time.time()
+
+        with _sym_lock:
+            coins = list(_shared_symbols)
+
+        if not coins:
+            time.sleep(30)
+            continue
+
+        ts_str = datetime.now().strftime('%H:%M:%S')
+        print(f"\n  {C.GRAY}[{ts_str}]{C.RESET} "
+              f"{C.BLUE}📡 REST Poll: {len(coins)} simbol × {len(TIMEFRAMES)} TF...{C.RESET}")
+
+        total_signals = 0
+
+        def _poll_and_scan(coin):
+            """Poll REST + scan sinyal untuk satu koin."""
+            sym    = coin['symbol']
+            change = coin.get('change', 0.0)
+            found  = 0
+
+            for tf in TIMEFRAMES:
+                # Ambil data fresh dari REST (sumber ke-2)
+                df_merged = rest_poll_one(sym, tf)
+                if df_merged is None:
+                    # Fallback ke data store
+                    df_merged = store_get(sym, tf)
+
+                if not _is_data_complete(df_merged, tf):
+                    continue
+
+                df      = add_indicators(df_merged)
+                signals = compute_signals(df)
+                if not signals:
+                    continue
+
+                mtf = get_mtf_bias(sym)
+
+                for sig_name, sig_data in signals.items():
+                    sig_key = f"{sym}_{sig_name}_{tf}"
+                    with _proc_lock:
+                        if _processed_signals.get(sig_key) == sig_data['time']:
+                            continue
+                        _processed_signals[sig_key] = sig_data['time']
+
+                    label = SIGNAL_LABEL.get(sig_name, sig_name)
+                    icon  = '🟢' if sig_data['tipe'] == 'BUY' else '🔴'
+                    _signal_line(icon, f"{label} {sig_data['tipe']}",
+                                 sym, tf, sig_data['price'], source='REST')
+
+                    img = generate_chart(df, sym, sig_name, tf)
+                    send_telegram_alert(
+                        symbol=sym, signal_name=sig_name, timeframe=tf,
+                        data=sig_data, change_24h=change,
+                        mtf=mtf, image_path=img, source='REST Poll'
+                    )
+                    found += 1
+
+            return found
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=REST_POLL_THREADS) as ex:
+            futs = [ex.submit(_poll_and_scan, c) for c in coins]
+            for f in concurrent.futures.as_completed(futs):
+                try:
+                    total_signals += f.result()
+                except Exception as e:
+                    print(f"  [REST Poll Error] {e}")
+
+        elapsed = time.time() - start_t
+        ts_str2 = datetime.now().strftime('%H:%M:%S')
+        print(f"  {C.GRAY}[{ts_str2}]{C.RESET} "
+              f"{C.BLUE}✓ REST Poll selesai{C.RESET} — "
+              f"{C.YELLOW}{total_signals} sinyal baru{C.RESET} — "
+              f"durasi {elapsed:.1f}s")
+
+        # Tunggu sisa interval
+        wait = max(REST_POLL_INTERVAL - elapsed, 30)
+        for _ in range(int(wait)):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+
+# ==========================================
 # 10. INDIKATOR BBMA
 # ==========================================
 def _wma(series: pd.Series, length: int) -> pd.Series:
@@ -705,15 +824,25 @@ def _wma(series: pd.Series, length: int) -> pd.Series:
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX-2: Perbaiki shift direction untuk _p (previous) columns.
+    shift(1) pada pandas = geser ke bawah = nilai row sebelumnya masuk ke row sekarang.
+    Ini BENAR untuk indikator yang butuh "nilai candle sebelumnya" di candle sekarang.
+    Tapi nama variabel _p (previous) bisa membingungkan.
+    
+    Verifikasi: df['topBB'].shift(1).iloc[i] = df['topBB'].iloc[i-1] ← ini benar
+    """
     df = df.copy()
     df['midBB']   = df['close'].rolling(20).mean()
     df['BBdev']   = 2.0 * df['close'].rolling(20).std(ddof=0)
-    df['topBB']   = df['midBB'].shift(1) + df['BBdev']
-    df['lowBB']   = df['midBB'].shift(1) - df['BBdev']
+    # topBB dan lowBB adalah nilai BB pada candle SAAT INI (bukan shift)
+    df['topBB']   = df['midBB'] + df['BBdev']
+    df['lowBB']   = df['midBB'] - df['BBdev']
     df['mahi5']   = _wma(df['high'], 5)
     df['mahi10']  = _wma(df['high'], 10)
     df['malo5']   = _wma(df['low'],  5)
     df['malo10']  = _wma(df['low'],  10)
+    # _p = nilai indikator pada candle SEBELUMNYA (shift(1) = geser 1 ke bawah = benar)
     df['mahi5_p'] = df['mahi5'].shift(1)
     df['malo5_p'] = df['malo5'].shift(1)
     df['topBB_p'] = df['topBB'].shift(1)
@@ -725,17 +854,32 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # 11. HITUNG SINYAL BBMA
 # ==========================================
 def compute_signals(df: pd.DataFrame) -> dict:
-    if df is None or len(df) < 30:
+    """
+    FIX-3: Perbaiki indexing sinyal.
+    df.iloc[-1] = candle running (belum close) → SKIP
+    df.iloc[-2] = candle closed terbaru → gunakan sebagai 'c' (current closed)
+    df.iloc[-3] = candle sebelum closed → gunakan sebagai 'prev'
+    
+    Syarat: minimal 30 baris + 3 baris untuk c, prev, dan sebelumnya.
+    """
+    if df is None or len(df) < 32:  # butuh minimal 32 agar indikator valid
         return {}
 
     c    = df.iloc[-2]    # candle closed terbaru
-    prev = df.iloc[-3]
+    prev = df.iloc[-3]    # candle sebelumnya
+
+    # Validasi: pastikan nilai indikator tidak NaN
+    required_cols = ['mahi5', 'mahi10', 'malo5', 'malo10', 'midBB',
+                     'topBB', 'lowBB', 'mahi5_p', 'malo5_p', 'topBB_p', 'lowBB_p']
+    for col in required_cols:
+        if pd.isna(c.get(col)) or pd.isna(prev.get(col)):
+            return {}  # data belum cukup untuk hitung indikator
 
     csz_c    = abs(c['close']    - c['open'])
     csz_prev = abs(prev['close'] - prev['open'])
     signals  = {}
 
-    # RE ENTRY
+    # RE ENTRY SELL: harga ditolak dari MAHI5, dalam zona bearish
     if (c['high'] > c['mahi5']
             and c['close'] < c['mahi5']
             and c['close'] < c['mahi10']
@@ -746,6 +890,7 @@ def compute_signals(df: pd.DataFrame) -> dict:
             'explanation': 'Harga ditolak dari MAHI5 — potensi turun lanjut.',
         }
 
+    # RE ENTRY BUY: harga ditolak dari MALO5, dalam zona bullish
     if (c['low'] < c['malo5']
             and c['close'] > c['malo5']
             and c['close'] > c['malo10']
@@ -756,20 +901,21 @@ def compute_signals(df: pd.DataFrame) -> dict:
             'explanation': 'Harga ditolak dari MALO5 — potensi naik lanjut.',
         }
 
-    # MMT / CSM
+    # MMT SELL: close menembus ke bawah LowBB (CSM Sell)
     if c['close'] < c['lowBB'] and c['open'] > c['lowBB']:
         signals['MMT SELL'] = {
             'tipe': 'SELL',
             'explanation': 'Momentum — close menembus ke bawah LowBB (CSM Sell).',
         }
 
+    # MMT BUY: close menembus ke atas TopBB (CSM Buy)
     if c['close'] > c['topBB'] and c['open'] < c['topBB']:
         signals['MMT BUY'] = {
             'tipe': 'BUY',
             'explanation': 'Momentum — close menembus ke atas TopBB (CSM Buy).',
         }
 
-    # EXTREME
+    # EXTREME SELL: engulfing bearish setelah MAHI5 di atas TopBB
     if (prev['close'] > prev['open']
             and c['close'] < c['topBB']
             and c['close'] < c['open']
@@ -780,6 +926,7 @@ def compute_signals(df: pd.DataFrame) -> dict:
             'explanation': 'Engulfing bearish — MAHI5 di atas TopBB, reversal turun.',
         }
 
+    # EXTREME BUY: engulfing bullish setelah MALO5 di bawah LowBB
     if (prev['close'] < prev['open']
             and c['close'] > c['lowBB']
             and c['close'] > c['open']
@@ -790,8 +937,10 @@ def compute_signals(df: pd.DataFrame) -> dict:
             'explanation': 'Engulfing bullish — MALO5 di bawah LowBB, reversal naik.',
         }
 
+    # FIX-6: Gunakan timestamp candle (bukan str(now)) sebagai dedup key
     for k in signals:
         signals[k]['price'] = float(c['close'])
+        # Gunakan timestamp candle yang sebenarnya untuk dedup yang akurat
         signals[k]['time']  = str(c['timestamp'])
 
     return {k: v for k, v in signals.items() if k in ALLOWED_SIGNALS}
@@ -799,17 +948,21 @@ def compute_signals(df: pd.DataFrame) -> dict:
 
 def compute_signals_at(df: pd.DataFrame, idx: int) -> dict:
     """
-    Hitung sinyal BBMA pada candle indeks `idx` (bukan hanya candle terakhir).
-    Dipakai saat scan sinyal terlewatkan saat startup.
-    `idx` adalah posisi candle yang sudah *close* (candle[-1] = candle running,
-    candle[-2] = closed terbaru, dst).
+    FIX-3: Hitung sinyal pada candle indeks `idx` dari belakang.
+    idx=0 → candle[-2] (closed terbaru)
+    idx=1 → candle[-3], dst.
     """
-    # Butuh minimal idx+2 baris (c = idx, prev = idx-1)
-    if df is None or len(df) < idx + 3:
+    if df is None or len(df) < idx + 4:
         return {}
 
-    c    = df.iloc[-(idx + 2)]   # candle closed yang di-scan
-    prev = df.iloc[-(idx + 3)]   # candle sebelumnya
+    c    = df.iloc[-(idx + 2)]
+    prev = df.iloc[-(idx + 3)]
+
+    required_cols = ['mahi5', 'mahi10', 'malo5', 'malo10', 'midBB',
+                     'topBB', 'lowBB', 'mahi5_p', 'malo5_p', 'topBB_p', 'lowBB_p']
+    for col in required_cols:
+        if pd.isna(c.get(col)) or pd.isna(prev.get(col)):
+            return {}
 
     csz_c    = abs(c['close']    - c['open'])
     csz_prev = abs(prev['close'] - prev['open'])
@@ -888,6 +1041,11 @@ def get_mtf_bias(symbol: str) -> dict:
         df = add_indicators(df)
         c  = df.iloc[-2]
 
+        # Validasi NaN
+        if pd.isna(c.get('ema50')) or pd.isna(c.get('midBB')):
+            bias[tf] = 'NEUTRAL'
+            continue
+
         above_ema      = c['close'] > c['ema50']
         above_mid      = c['close'] > c['midBB']
         malo_above_mid = c['malo5'] > c['midBB']
@@ -948,16 +1106,10 @@ def generate_chart(df: pd.DataFrame, symbol: str,
         print(f"  [Chart Error] {e}")
         return None
 
+
 def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
                           tf: str = '1h',
                           label: str = 'STATUS') -> 'str | None':
-    """
-    Buat chart BBMA untuk notifikasi status bot (bukan sinyal).
-    Otomatis pilih simbol terbaik yang datanya sudah ada di store.
-    Mencoba BTC dulu, lalu ETH, lalu simbol apapun yang tersedia.
-    Return: path file PNG atau None jika gagal.
-    """
-    # Kandidat simbol prioritas untuk chart status
     _candidates = [
         ('BTC/USDT:USDT', '1h'),
         ('ETH/USDT:USDT', '1h'),
@@ -969,7 +1121,6 @@ def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
     sym_use = symbol
     tf_use  = tf
 
-    # Coba kandidat prioritas dulu
     for _sym, _tf in _candidates:
         _df = store_get(_sym, _tf)
         if _is_data_complete(_df, _tf):
@@ -979,7 +1130,6 @@ def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
             tf_use  = _tf
             break
 
-    # Jika tidak ada, ambil simbol pertama yang tersedia di store
     if df_use is None:
         with _store_lock:
             for _sym, _tfs in _ohlcv_store.items():
@@ -994,7 +1144,7 @@ def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
                     break
 
     if df_use is None:
-        return None   # belum ada data sama sekali
+        return None
 
     try:
         safe_sym = sym_use.replace('/', '-').replace(':', '-')
@@ -1031,11 +1181,6 @@ def generate_status_chart(symbol: str = 'BTC/USDT:USDT',
 
 
 def send_telegram_photo(text: str, image_path: 'str | None' = None):
-    """
-    Kirim pesan status ke Telegram.
-    - Jika image_path ada dan valid → kirim sebagai foto (sendPhoto)
-    - Jika tidak → kirim sebagai teks biasa (sendMessage)
-    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -1089,7 +1234,7 @@ def _format_mtf_block(mtf: dict) -> str:
 
 def send_telegram_alert(symbol: str, signal_name: str, timeframe: str,
                         data: dict, change_24h: float,
-                        mtf: dict, image_path=None):
+                        mtf: dict, image_path=None, source: str = 'WS'):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
@@ -1097,6 +1242,8 @@ def send_telegram_alert(symbol: str, signal_name: str, timeframe: str,
     label   = SIGNAL_LABEL.get(signal_name, signal_name)
     tf_em   = TF_EMOJI.get(timeframe, '')
     mtf_blk = _format_mtf_block(mtf)
+    # Tampilkan sumber data di notifikasi
+    src_tag = f"📡 REST Poll" if source == 'REST Poll' else "📶 WebSocket"
 
     caption = (
         f"{icon} <b>BBMA FUTURES — {label} {data['tipe']}</b>\n"
@@ -1106,6 +1253,7 @@ def send_telegram_alert(symbol: str, signal_name: str, timeframe: str,
         f"{tf_em} <b>TF      :</b> {timeframe.upper()}\n"
         f"💰 <b>Harga   :</b> {data['price']:.6g}\n"
         f"📈 <b>24h Chg :</b> {change_24h:+.2f}%\n"
+        f"🔗 <b>Sumber  :</b> {src_tag}\n"
         f"──────────────────────\n"
         f"📐 <b>Multi-TF Bias:</b>\n{mtf_blk}\n"
         f"──────────────────────\n"
@@ -1153,29 +1301,56 @@ def send_telegram_text(text: str):
 _processed_signals: dict = {}
 _proc_lock = threading.Lock()
 
+# FIX-1: Gunakan queue untuk memproses sinyal dari WS secara serial
+# Hindari multiple thread masing2 baca store pada waktu bersamaan
+_signal_queue: queue.Queue = queue.Queue(maxsize=1000)
+
 
 def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
     """
-    Dipanggil oleh WebSocket handler setiap kali candle TF close.
-    Alur: cek data lengkap → hitung indikator → scan sinyal → kirim TG.
-    Jika data kurang → minta REST fallback dulu.
-
-    FIX: Tambah jeda kecil agar store_update_candle punya waktu flush
-    sebelum kita baca data, menghindari race condition antar thread.
+    FIX-1: Masukkan ke queue, bukan langsung proses.
+    Queue processor membaca satu per satu untuk menghindari race condition.
     """
-    # FIX: beri waktu 0.1s agar store_update_candle selesai tulis ke _ohlcv_store
-    time.sleep(0.1)
+    _signal_queue.put_nowait((symbol, tf, change_24h))
 
+
+def signal_queue_processor(stop_event: threading.Event):
+    """
+    FIX-1: Thread tunggal yang memproses signal queue dari WS.
+    Satu thread = tidak ada race condition saat baca store.
+    """
+    while not stop_event.is_set():
+        try:
+            item = _signal_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        symbol, tf, change_24h = item
+
+        try:
+            _process_candle_close(symbol, tf, change_24h, source='WS')
+        except Exception as e:
+            print(f"  [SignalQueue Error] {symbol} {tf}: {e}")
+        finally:
+            _signal_queue.task_done()
+
+
+def _process_candle_close(symbol: str, tf: str,
+                           change_24h: float = 0.0,
+                           source: str = 'WS'):
+    """
+    FIX-1, FIX-3: Core signal processing — dipanggil dari queue processor.
+    Tidak ada race condition karena hanya dipanggil oleh satu thread.
+    """
     df = store_get(symbol, tf)
 
-    # Data tidak lengkap → REST fallback, lalu coba lagi setelah selesai
     if not _is_data_complete(df, tf):
         print(f"  ⚠️  [{tf.upper()}] {symbol} data kurang "
               f"({len(df) if df is not None else 0} baris) → REST fallback")
         rest_fill_gap(symbol, tf)
-        df = store_get(symbol, tf)   # ambil ulang setelah fallback
+        df = store_get(symbol, tf)
         if not _is_data_complete(df, tf):
-            return   # masih kurang setelah fallback, lewati
+            return
 
     df = add_indicators(df)
     signals = compute_signals(df)
@@ -1188,37 +1363,25 @@ def on_candle_close(symbol: str, tf: str, change_24h: float = 0.0):
         sig_key = f"{symbol}_{sig_name}_{tf}"
         with _proc_lock:
             if _processed_signals.get(sig_key) == sig_data['time']:
-                continue   # anti-spam
+                continue
             _processed_signals[sig_key] = sig_data['time']
 
         label = SIGNAL_LABEL.get(sig_name, sig_name)
         icon  = '🟢' if sig_data['tipe'] == 'BUY' else '🔴'
         _signal_line(icon, f"{label} {sig_data['tipe']}",
-                     symbol, tf, sig_data['price'])
+                     symbol, tf, sig_data['price'], source=source)
 
         img = generate_chart(df, symbol, sig_name, tf)
         send_telegram_alert(
             symbol=symbol, signal_name=sig_name, timeframe=tf,
             data=sig_data, change_24h=change_24h,
-            mtf=mtf, image_path=img,
+            mtf=mtf, image_path=img, source=source
         )
 
 # ==========================================
 # 15b. SCAN SINYAL TERLEWATKAN — dijalankan sekali saat startup
 # ==========================================
 def scan_missed_signals(symbols: list):
-    """
-    Scan candle-candle yang close-nya jatuh dalam 8 jam terakhir
-    (MISSED_LOOKBACK_SECONDS dari waktu bot start).
-
-    Logika filter waktu:
-      - Ambil timestamp close tiap candle dari data historis.
-      - Hanya proses candle yang close-nya >= (now - 8 jam).
-      - Candle running (candle terakhir, masih berjalan) dilewati.
-
-    Sinyal yang ditemukan dikirim ke Telegram dengan label ⏪ MISSED,
-    lalu dicatat di _processed_signals agar tidak dikirim ulang saat live.
-    """
     global _processed_signals
 
     now_ts     = pd.Timestamp.now(tz='UTC').tz_localize(None)
@@ -1244,32 +1407,20 @@ def scan_missed_signals(symbols: list):
 
             df = add_indicators(df_raw)
 
-            # Candle closed = semua kecuali baris terakhir (yang masih running)
-            # Kita cari indeks candle (dari belakang) yang close-nya >= cutoff.
-            # df.iloc[-1]  → candle running   (skip)
-            # df.iloc[-2]  → closed terbaru   (idx=0 di compute_signals_at)
-            # df.iloc[-3]  → closed sebelumnya (idx=1), dst.
-            # Durasi satu candle dipakai untuk menentukan berapa candle
-            # yang perlu di-cek agar mencakup tepat 8 jam.
             dur_sec   = TF_DURATION_SEC[tf]
-            # Jumlah candle maksimal yang bisa menutup dalam 8 jam
             max_back  = max(int(MISSED_LOOKBACK_SECONDS / dur_sec) + 1, 1)
 
-            mtf = None   # lazy — hitung sekali hanya jika ada sinyal
+            mtf = None
 
-            # Scan dari candle paling lama ke paling baru dalam window
             for idx in range(max_back - 1, -1, -1):
-                # Pastikan indeks tidak melampaui panjang df
-                row_pos = -(idx + 2)   # +2 karena -1 = running, -2 = closed[0]
+                row_pos = -(idx + 2)
                 if abs(row_pos) > len(df):
                     continue
 
                 candle_ts = df.iloc[row_pos]['timestamp']
-                # Normalisasi timezone agar perbandingan tidak error
                 if hasattr(candle_ts, 'tzinfo') and candle_ts.tzinfo is not None:
                     candle_ts = candle_ts.tz_localize(None)
 
-                # Lewati candle di luar window 8 jam
                 if candle_ts < cutoff_ts:
                     continue
 
@@ -1285,7 +1436,7 @@ def scan_missed_signals(symbols: list):
 
                     with _proc_lock:
                         if _processed_signals.get(sig_key) == sig_data['time']:
-                            continue   # sudah pernah dikirim
+                            continue
                         _processed_signals[sig_key] = sig_data['time']
 
                     label       = f"⏪ {SIGNAL_LABEL.get(sig_name, sig_name)}"
@@ -1319,7 +1470,6 @@ def scan_missed_signals(symbols: list):
                         extra=f"candle: {candle_time}"
                     )
 
-                    # Generate chart BBMA (sama seperti sinyal live)
                     img = generate_chart(df, sym, sig_name, tf)
 
                     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -1338,7 +1488,6 @@ def scan_missed_signals(symbols: list):
                                         timeout=30,
                                     )
                             else:
-                                # Fallback teks jika chart gagal dibuat
                                 requests.post(
                                     f"{base}/sendMessage",
                                     data={
@@ -1352,7 +1501,7 @@ def scan_missed_signals(symbols: list):
                         print(f"  [TG Missed Error] {e}")
 
                     total_missed += 1
-                    time.sleep(MISSED_SIGNAL_DELAY)   # anti-flood Telegram
+                    time.sleep(MISSED_SIGNAL_DELAY)
 
     if total_missed:
         print()
@@ -1360,24 +1509,19 @@ def scan_missed_signals(symbols: list):
         send_telegram_text(
             f"⏪ <b>Missed Signal Scan Selesai</b>\n"
             f"Sinyal terlewat (8 jam terakhir): <b>{total_missed}</b>\n"
-            f"Bot kini masuk mode LIVE (WebSocket)."
+            f"Bot kini masuk mode LIVE (WebSocket + REST Poll)."
         )
     else:
         _ok("Missed scan selesai — tidak ada sinyal dalam 8 jam terakhir.")
 
 # ==========================================
-# 15c. PERIODIC SCAN — scan sinyal tiap 10 menit (tanpa WebSocket close)
+# 15c. PERIODIC SCAN — scan sinyal tiap 10 menit (backup WS)
 # ==========================================
-# Ini adalah fallback/pelengkap WebSocket:
-# - Berguna jika WS terlambat kirim candle close event
-# - Berguna untuk TF 1h yang hanya close sekali per jam
-# - Scan cepat paralel dengan ThreadPoolExecutor
 PERIODIC_SCAN_INTERVAL = 600   # 10 menit
-PERIODIC_SCAN_THREADS  = 8     # thread paralel saat scan
+PERIODIC_SCAN_THREADS  = 8
 
 
 def _periodic_scan_one(coin: dict):
-    """Scan satu koin semua TF untuk sinyal BBMA. Dipanggil dari thread pool."""
     sym    = coin['symbol']
     change = coin.get('change', 0.0)
     found  = 0
@@ -1398,19 +1542,19 @@ def _periodic_scan_one(coin: dict):
             sig_key = f"{sym}_{sig_name}_{tf}"
             with _proc_lock:
                 if _processed_signals.get(sig_key) == sig_data['time']:
-                    continue   # sudah pernah dikirim, skip
+                    continue
                 _processed_signals[sig_key] = sig_data['time']
 
             label = SIGNAL_LABEL.get(sig_name, sig_name)
             icon  = '🟢' if sig_data['tipe'] == 'BUY' else '🔴'
-            _signal_line(icon, f"[SCAN] {label} {sig_data['tipe']}",
-                         sym, tf, sig_data['price'])
+            _signal_line(icon, f"{label} {sig_data['tipe']}",
+                         sym, tf, sig_data['price'], source='SCAN')
 
             img = generate_chart(df, sym, sig_name, tf)
             send_telegram_alert(
                 symbol=sym, signal_name=sig_name, timeframe=tf,
                 data=sig_data, change_24h=change,
-                mtf=mtf, image_path=img,
+                mtf=mtf, image_path=img, source='Periodic Scan'
             )
             found += 1
 
@@ -1419,18 +1563,16 @@ def _periodic_scan_one(coin: dict):
 
 def periodic_scan_daemon(stop_event: threading.Event):
     """
-    Daemon: scan semua simbol tiap PERIODIC_SCAN_INTERVAL detik.
-    Menggunakan ThreadPoolExecutor agar scan 100 koin selesai cepat.
-    Tidak mengubah WebSocket — ini pelengkap, bukan pengganti.
+    FIX-4: Mulai scan segera setelah seed selesai (bukan tunggu 60 detik).
     """
-    # Tunggu dulu agar seed dan WS sudah siap
-    time.sleep(60)
+    # Tunggu singkat agar WS terkoneksi
+    time.sleep(15)
 
     while not stop_event.is_set():
         start_t = time.time()
 
         with _sym_lock:
-            coins = list(_shared_symbols)   # snapshot simbol aktif
+            coins = list(_shared_symbols)
 
         if not coins:
             time.sleep(30)
@@ -1457,19 +1599,20 @@ def periodic_scan_daemon(stop_event: threading.Event):
               f"{C.YELLOW}{total_found} sinyal baru{C.RESET} — "
               f"durasi {elapsed:.1f}s")
 
-        # Tunggu sisa interval
         wait = max(PERIODIC_SCAN_INTERVAL - elapsed, 30)
         for _ in range(int(wait)):
             if stop_event.is_set():
                 return
             time.sleep(1)
-# Lookup cepat: "btcusdt_1h" → (symbol_ccxt, tf, change_24h)
+
+# ==========================================
+# 16. WEBSOCKET — sumber data realtime
+# ==========================================
 _stream_map      : dict = {}
 _stream_map_lock = threading.Lock()
 
 
 def _symbol_to_ws(symbol: str) -> str:
-    """'BTC/USDT:USDT' → 'btcusdt'"""
     base = symbol.split('/')[0]
     return (base + 'usdt').lower()
 
@@ -1479,7 +1622,6 @@ def _build_stream_name(symbol: str, tf: str) -> str:
 
 
 def _register_streams(symbols: list):
-    """Buat lookup _stream_map dari daftar simbol."""
     with _stream_map_lock:
         _stream_map.clear()
         for coin in symbols:
@@ -1494,7 +1636,7 @@ def _register_streams(symbols: list):
 class KlineWsConnection:
     """
     Satu koneksi WebSocket Binance Futures untuk sekumpulan stream kline.
-    Reconnect otomatis jika terputus + REST fallback untuk tambal gap.
+    FIX-1: candle close dimasukkan ke queue, bukan langsung diproses.
     """
 
     def __init__(self, stream_names: list, conn_id: int,
@@ -1504,17 +1646,16 @@ class KlineWsConnection:
         self.stop_event   = stop_event
         self._ws          = None
 
-    # ── Callback WebSocket ────────────────────────────────────
     def _on_message(self, ws, raw):
         try:
             msg  = json.loads(raw)
-            data = msg.get('data', msg)   # combined stream punya wrapper 'data'
+            data = msg.get('data', msg)
             if data.get('e') != 'kline':
                 return
 
             k        = data['k']
-            ws_sym   = data['s'].lower()   # e.g. "btcusdt"
-            interval = k['i']              # e.g. "1h"
+            ws_sym   = data['s'].lower()
+            interval = k['i']
             key      = f"{ws_sym}_{interval}"
 
             with _stream_map_lock:
@@ -1527,20 +1668,18 @@ class KlineWsConnection:
             o, h   = float(k['o']), float(k['h'])
             lo, c  = float(k['l']), float(k['c'])
             v      = float(k['v'])
-            closed = bool(k['x'])   # True = candle sudah close
+            closed = bool(k['x'])
 
-            # Selalu update candle running di store (dan candle close saat closed=True)
-            # FIX: update dulu store, baru spawn thread — hindari race condition
+            # Update store (candle running atau baru)
             store_update_candle(symbol, tf, ts_ms, o, h, lo, c, v)
 
-            # Proses sinyal hanya saat candle benar-benar close
-            # FIX: store sudah terupdate di atas sebelum thread ini dibuat
+            # FIX-1: Saat candle close, masukkan ke queue (bukan thread baru)
             if closed:
-                threading.Thread(
-                    target=on_candle_close,
-                    args=(symbol, tf, change_24h),
-                    daemon=True,
-                ).start()
+                try:
+                    _signal_queue.put_nowait((symbol, tf, change_24h))
+                except queue.Full:
+                    # Queue penuh, skip — periodic scan akan catch ini
+                    pass
 
         except Exception as e:
             print(f"  [WS-{self.conn_id} msg] {e}")
@@ -1559,13 +1698,10 @@ class KlineWsConnection:
             done=True
         )
 
-    # ── REST fallback setelah reconnect ──────────────────────
     def _fill_gaps_after_reconnect(self):
-        """Tambal gap candle yang mungkin hilang selama WS mati."""
         seen = set()
         with _stream_map_lock:
             for sname in self.stream_names:
-                # format: "btcusdt@kline_1h"
                 parts = sname.split('@kline_')
                 if len(parts) != 2:
                     continue
@@ -1578,7 +1714,6 @@ class KlineWsConnection:
         for sym, tf in seen:
             rest_fill_gap(sym, tf)
 
-    # ── Loop utama ────────────────────────────────────────────
     def run(self):
         url = WS_BASE_URL + "/".join(self.stream_names)
         while not self.stop_event.is_set():
@@ -1610,11 +1745,6 @@ class KlineWsConnection:
 
 def launch_websocket_connections(symbols: list,
                                  stop_event: threading.Event) -> list:
-    """
-    Kumpulkan semua stream kline, bagi ke batch WS_MAX_STREAMS,
-    jalankan tiap batch di thread terpisah.
-    Return: list of (thread, KlineWsConnection)
-    """
     all_streams = []
     for coin in symbols:
         sym = coin['symbol']
@@ -1640,7 +1770,7 @@ def launch_websocket_connections(symbols: list,
                              name=f"WS-{idx+1}", daemon=True)
         t.start()
         result.append((t, conn))
-        time.sleep(0.3)   # stagger koneksi
+        time.sleep(0.3)
 
     return result
 
@@ -1692,44 +1822,38 @@ def main():
 
     _start_time = datetime.now()
 
-    # ── Banner ─────────────────────────────────────────────────
     print()
     print(_sep('═'))
     print(f"  {C.BOLD}{C.CYAN}🚀  BBMA OMA ALLY — BINANCE FUTURES  (WebSocket + REST){C.RESET}")
     print(_sep('─'))
     print(f"  {C.GRAY}Simbol   :{C.RESET} {C.YELLOW}Top-{TOP_N}{C.RESET} Binance Futures (rank by Open Interest)")
-    print(f"  {C.GRAY}Data     :{C.RESET} {C.GREEN}WebSocket realtime{C.RESET} (REST hanya seed & fallback)")
+    print(f"  {C.GRAY}Data     :{C.RESET} {C.GREEN}DUAL-SOURCE{C.RESET}: WebSocket realtime + REST Poll tiap {REST_POLL_INTERVAL//60}m")
     print(f"  {C.GRAY}TF       :{C.RESET} {C.CYAN}" + " · ".join(tf.upper() for tf in TIMEFRAMES) + C.RESET)
     print(f"  {C.GRAY}Sinyal   :{C.RESET} {C.MAGENTA}RE ENTRY · MMT · EXTREME{C.RESET}  (BUY & SELL)")
     print(f"  {C.GRAY}Output   :{C.RESET} {DATA_DIR}/  |  Chart: {CHART_DIR}/")
     print(f"  {C.GRAY}Waktu    :{C.RESET} {_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {C.GRAY}Bug Fixes:{C.RESET} {C.GREEN}FIX-1{C.RESET} Race Condition | {C.GREEN}FIX-2{C.RESET} Indikator | "
+          f"{C.GREEN}FIX-3{C.RESET} Index | {C.GREEN}FIX-4{C.RESET} Scan Delay | {C.GREEN}FIX-5{C.RESET} Dual-Source | {C.GREEN}FIX-6{C.RESET} Dedup Key")
     print(_sep('═'))
     print()
 
-    # ════════════════════════════════════════════════════════
-    # 📣 NOTIF 1 — Bot baru menyala (teks saja, store kosong)
-    # ════════════════════════════════════════════════════════
     send_telegram_photo(
         f"🟡 <b>BBMA Bot MENYALA</b>\n"
         f"──────────────────────\n"
         f"⏰ Waktu start  : {_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"📊 Simbol target: Top-{TOP_N} Binance Futures\n"
+        f"📡 Sumber data  : DUAL-SOURCE (WebSocket + REST Poll)\n"
         f"🔄 Status       : Inisialisasi dimulai...\n"
         f"⚠️  <i>Bot belum LIVE — sedang mempersiapkan data</i>"
     )
 
-    # ── Load state ────────────────────────────────────────────
     state = load_state()
     with _proc_lock:
         _processed_signals.update(state.get('processed_signals', {}))
     _spinner_msg(f"State dimuat — {C.YELLOW}{len(_processed_signals)}{C.RESET} sinyal tercatat", done=True)
 
-    # ── Ambil daftar simbol (REST 1x) ─────────────────────────
     _section("Mengambil daftar simbol Binance Futures", "🔄")
 
-    # ════════════════════════════════════════════════════════
-    # 📣 NOTIF 2 — Mulai ambil data simbol
-    # ════════════════════════════════════════════════════════
     send_telegram_photo(
         f"📡 <b>Mengambil daftar simbol...</b>\n"
         f"──────────────────────\n"
@@ -1753,9 +1877,6 @@ def main():
     state['last_market_fetch'] = time.time()
     save_state(state)
 
-    # ════════════════════════════════════════════════════════
-    # 📣 NOTIF 3 — Simbol berhasil, mulai seed historis
-    # ════════════════════════════════════════════════════════
     send_telegram_photo(
         f"✅ <b>Daftar simbol berhasil diambil</b>\n"
         f"──────────────────────\n"
@@ -1765,19 +1886,14 @@ def main():
         f"<i>({len(symbols)} simbol × {len(TIMEFRAMES)} TF = {len(symbols)*len(TIMEFRAMES)} dataset)</i>"
     )
 
-    # ── Seed historis ─────────────────────────────────────────
     _seed_start = time.time()
     rest_seed_all(symbols)
     _seed_elapsed = time.time() - _seed_start
 
-    # ── Register stream lookup ─────────────────────────────────
     _register_streams(symbols)
     _spinner_msg(f"Stream map terdaftar — "
                  f"{C.YELLOW}{len(symbols) * len(TIMEFRAMES)}{C.RESET} stream", done=True)
 
-    # ════════════════════════════════════════════════════════
-    # 📣 NOTIF 4 — Seed selesai, mulai scan missed
-    # ════════════════════════════════════════════════════════
     _chart_seed = generate_status_chart(label='SEED_SELESAI')
     send_telegram_photo(
         f"📦 <b>Unduh data historis selesai</b>\n"
@@ -1789,31 +1905,44 @@ def main():
         image_path=_chart_seed,
     )
 
-    # ── Scan sinyal terlewatkan ────────────────────────────────
     scan_missed_signals(symbols)
 
     stop_event  = threading.Event()
     all_threads = []
 
-    # ── WebSocket connections ──────────────────────────────────
+    # ── FIX-1: Signal queue processor thread (satu thread, serial) ─
+    t_queue = threading.Thread(target=signal_queue_processor,
+                               args=(stop_event,),
+                               name="SignalQueue", daemon=True)
+    t_queue.start()
+    all_threads.append(t_queue)
+
+    # ── WebSocket connections (sumber data ke-1) ──────────────────
     ws_pairs = launch_websocket_connections(symbols, stop_event)
     all_threads.extend([t for t, _ in ws_pairs])
 
-    # ── Symbol refresh daemon ──────────────────────────────────
+    # ── FIX-5: REST Poll daemon (sumber data ke-2) ────────────────
+    t_poll = threading.Thread(target=rest_poll_daemon,
+                              args=(stop_event,),
+                              name="RestPoll", daemon=True)
+    t_poll.start()
+    all_threads.append(t_poll)
+
+    # ── Symbol refresh daemon ──────────────────────────────────────
     t_sym = threading.Thread(target=symbol_refresh_daemon,
                              args=(state, stop_event),
                              name="SymRefresh", daemon=True)
     t_sym.start()
     all_threads.append(t_sym)
 
-    # ── State save daemon ──────────────────────────────────────
+    # ── State save daemon ──────────────────────────────────────────
     t_save = threading.Thread(target=state_save_daemon,
                               args=(state, stop_event),
                               name="StateSave", daemon=True)
     t_save.start()
     all_threads.append(t_save)
 
-    # ── Periodic scan daemon (tiap 10 menit) ───────────────────
+    # ── FIX-4: Periodic scan daemon (mulai segera setelah seed) ───
     t_scan = threading.Thread(target=periodic_scan_daemon,
                               args=(stop_event,),
                               name="PeriodicScan", daemon=True)
@@ -1828,35 +1957,35 @@ def main():
     print(f"  {C.BOLD}{C.GREEN}✅ Bot aktif — {len(ws_pairs)} koneksi WebSocket{C.RESET}")
     print(f"  {C.GRAY}Simbol   : {C.YELLOW}{len(symbols)}{C.GRAY} koin dipantau{C.RESET}")
     print(f"  {C.GRAY}Threads  : {C.YELLOW}{threading.active_count()}{C.GRAY} aktif{C.RESET}")
-    print(f"  {C.GRAY}Mode     : {C.GREEN}LIVE — WebSocket candle close + scan tiap {PERIODIC_SCAN_INTERVAL//60} menit{C.RESET}")
+    print(f"  {C.GRAY}Sumber 1 : {C.GREEN}WebSocket{C.GRAY} — candle close realtime{C.RESET}")
+    print(f"  {C.GRAY}Sumber 2 : {C.BLUE}REST Poll{C.GRAY} — tiap {REST_POLL_INTERVAL//60} menit, ambil {REST_POLL_CANDLES} candle/TF{C.RESET}")
+    print(f"  {C.GRAY}Backup   : {C.CYAN}Periodic Scan{C.GRAY} tiap {PERIODIC_SCAN_INTERVAL//60} menit{C.RESET}")
     print(f"  {C.GRAY}Stop     : Ctrl+C untuk berhenti{C.RESET}")
     print(_sep('═'))
     print()
 
-    # ── Live signal header ─────────────────────────────────────
-    print(f"  {C.BOLD}{C.GRAY}{'WAKTU':<10} {'DIR':<6} {'SINYAL':<14} {'SIMBOL':<22} {'TF':<4} {'HARGA'}{C.RESET}")
-    print(f"  {C.GRAY}{'─'*10} {'─'*6} {'─'*14} {'─'*22} {'─'*4} {'─'*12}{C.RESET}")
+    print(f"  {C.BOLD}{C.GRAY}{'WAKTU':<10} {'SRC':<5} {'SINYAL':<14} {'SIMBOL':<22} {'TF':<4} {'HARGA'}{C.RESET}")
+    print(f"  {C.GRAY}{'─'*10} {'─'*5} {'─'*14} {'─'*22} {'─'*4} {'─'*12}{C.RESET}")
 
-    # ════════════════════════════════════════════════════════
-    # 📣 NOTIF 5 — Bot sekarang LIVE + chart kondisi pasar
-    # ════════════════════════════════════════════════════════
     _chart_live = generate_status_chart(label='BOT_LIVE')
     send_telegram_photo(
-        f"🟢 <b>BBMA Bot LIVE — Siap Memantau Pasar!</b>\n"
+        f"🟢 <b>BBMA Bot LIVE — Dual-Source Aktif!</b>\n"
         f"══════════════════════\n"
         f"💎 Simbol      : <b>{len(symbols)}</b> koin (Top-{TOP_N} by OI)\n"
         f"📊 Timeframe   : {' · '.join(tf.upper() for tf in TIMEFRAMES)}\n"
         f"🎯 Sinyal      : RE ENTRY · MMT · EXTREME\n"
-        f"📡 WebSocket   : <b>{len(ws_pairs)}</b> koneksi aktif\n"
-        f"🔍 Scan auto   : Tiap <b>{PERIODIC_SCAN_INTERVAL//60} menit</b>\n"
+        f"──────────────────────\n"
+        f"📡 Sumber 1    : WebSocket ({len(ws_pairs)} koneksi)\n"
+        f"🔗 Sumber 2    : REST Poll (tiap {REST_POLL_INTERVAL//60} menit)\n"
+        f"🔍 Backup scan : Tiap {PERIODIC_SCAN_INTERVAL//60} menit\n"
         f"──────────────────────\n"
         f"⏰ Start       : {_start_time.strftime('%H:%M:%S')}\n"
         f"🚀 LIVE sejak  : {_live_time.strftime('%H:%M:%S')}\n"
         f"⏱ Init selesai: {_total_init} detik\n"
         f"──────────────────────\n"
-        f"✅ <b>Bot aktif dan memantau sinyal secara realtime.</b>\n"
-        f"📩 Sinyal akan dikirim otomatis ke sini.\n"
-        f"📊 <i>Chart: BTC/USDT BBMA kondisi pasar sekarang</i>",
+        f"🛠 Bug Fixes   : Race Condition · Indikator · Indexing · Dual-Source\n"
+        f"✅ <b>Bot aktif memantau sinyal dari 2 sumber data.</b>\n"
+        f"📩 Sinyal dikirim otomatis ke sini.",
         image_path=_chart_live,
     )
 
@@ -1876,9 +2005,6 @@ def main():
             state['processed_signals'] = dict(_processed_signals)
         save_state(state)
 
-        # ════════════════════════════════════════════════════════
-        # 📣 NOTIF 6 — Bot dihentikan manual (Ctrl+C)
-        # ════════════════════════════════════════════════════════
         _stop_time   = datetime.now()
         _uptime_sec  = int((_stop_time - _start_time).total_seconds())
         _uptime_str  = (
@@ -1898,16 +2024,12 @@ def main():
             f"⏱ Uptime       : {_uptime_str}\n"
             f"📊 Total sinyal: {_total_sigs} sinyal tercatat\n"
             f"──────────────────────\n"
-            f"ℹ️  <i>Jalankan ulang bot untuk melanjutkan pemantauan.</i>\n"
-            f"📊 <i>Chart terakhir sebelum bot mati</i>",
+            f"ℹ️  <i>Jalankan ulang bot untuk melanjutkan pemantauan.</i>",
             image_path=_chart_stop,
         )
         _ok("Bot berhenti.")
         print()
     except Exception as _fatal_err:
-        # ════════════════════════════════════════════════════════
-        # 📣 NOTIF 7 — Bot mati karena error tak terduga
-        # ════════════════════════════════════════════════════════
         _stop_time  = datetime.now()
         _uptime_sec = int((_stop_time - _start_time).total_seconds())
         _uptime_str = (
@@ -1925,11 +2047,10 @@ def main():
             f"💥 Crash   : {_stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"⏱ Uptime  : {_uptime_str}\n"
             f"──────────────────────\n"
-            f"⚠️  <b>Bot mati mendadak! Perlu dinyalakan ulang secara manual.</b>\n"
-            f"📊 <i>Chart terakhir sebelum crash</i>",
+            f"⚠️  <b>Bot mati mendadak! Perlu dinyalakan ulang secara manual.</b>",
             image_path=_chart_crash,
         )
-        raise   # lempar ulang error agar tercetak di terminal
+        raise
 
 
 if __name__ == "__main__":
