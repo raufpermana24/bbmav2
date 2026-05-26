@@ -78,24 +78,21 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',   '8361349338:AAHOlx4fKz_bp1
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003979979885')
 
 # ── Timeframe ──────────────────────────────────────────────────
-# CATATAN: TIMEFRAMES bisa diubah via perintah Telegram (/settf)
-_ALL_TIMEFRAMES = ['1h', '4h', '8h', '12h', '1d', '1w']   # daftar TF yang didukung
-TIMEFRAMES      = ['1h', '4h', '8h', '12h', '1d', '1w']   # TF aktif (bisa diubah runtime)
-_tf_lock        = threading.Lock()                          # lock untuk ubah TIMEFRAMES
+TIMEFRAMES = ['1h', '4h', '1d', '1w']
 
 # Jumlah candle historis yang di-seed via REST saat pertama start
-TF_SEED_LIMIT = {'1h': 300, '4h': 200, '8h': 200, '12h': 150, '1d': 200, '1w': 100}
+TF_SEED_LIMIT = {'1h': 300, '4h': 200, '1d': 200, '1w': 100}
 
 # Minimum candle agar DataFrame dianggap lengkap untuk indikator
-TF_MIN_ROWS = {'1h': 60, '4h': 50, '8h': 50, '12h': 40, '1d': 50, '1w': 30}
+TF_MIN_ROWS = {'1h': 60, '4h': 50, '1d': 50, '1w': 30}
 
 # Durasi satu candle (detik) — untuk hitung gap setelah reconnect
-TF_DURATION_SEC = {'1h': 3600, '4h': 14400, '8h': 28800, '12h': 43200, '1d': 86400, '1w': 604800}
+TF_DURATION_SEC = {'1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800}
 
 # Mapping TF bot → interval Binance WebSocket
-TF_WS_INTERVAL = {'1h': '1h', '4h': '4h', '8h': '8h', '12h': '12h', '1d': '1d', '1w': '1w'}
+TF_WS_INTERVAL = {'1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w'}
 
-TF_WEIGHT  = {'1h': 1, '4h': 2, '8h': 3, '12h': 4, '1d': 5, '1w': 6}
+TF_WEIGHT  = {'1h': 1, '4h': 2, '1d': 3, '1w': 4}
 MIN_VOLUME = 500_000     # minimal quoteVolume $500 ribu
 TOP_N      = 100         # jumlah simbol teratas berdasarkan Open Interest
 
@@ -226,7 +223,7 @@ ALLOWED_SIGNALS = {
     'EXTREME BUY', 'EXTREME SELL',
 }
 SIGNAL_ICON  = {'BUY': '🟢', 'SELL': '🔴'}
-TF_EMOJI     = {'1h': '🕐', '4h': '🕓', '8h': '🕗', '12h': '🕛', '1d': '📅', '1w': '📆'}
+TF_EMOJI     = {'1h': '🕐', '4h': '🕓', '1d': '📅', '1w': '📆'}
 DIR_EMOJI    = {'BUY': '🟢', 'SELL': '🔴', 'NEUTRAL': '⚪', 'MIXED': '🟡'}
 SIGNAL_LABEL = {
     'REENTRY BUY':  '🔁 RE ENTRY',  'REENTRY SELL': '🔁 RE ENTRY',
@@ -1482,6 +1479,500 @@ def send_telegram_text(text: str):
     except Exception:
         pass
 
+
+def send_telegram_message(chat_id, text: str, reply_markup=None, parse_mode='HTML'):
+    """Kirim pesan ke chat_id tertentu (bisa berbeda dari TELEGRAM_CHAT_ID)."""
+    base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    payload = {
+        'chat_id':    chat_id,
+        'text':       text,
+        'parse_mode': parse_mode,
+    }
+    if reply_markup:
+        payload['reply_markup'] = json.dumps(reply_markup)
+    try:
+        r = requests.post(f"{base}/sendMessage", json=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        print(f"  [TG SendMsg Error] {e}")
+        return None
+
+
+def answer_callback_query(callback_query_id: str, text: str = ''):
+    """Acknowledge tombol inline agar spinner di Telegram berhenti."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={'callback_query_id': callback_query_id, 'text': text},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# ==========================================
+# 14b. TELEGRAM COMMAND HANDLER
+# ==========================================
+# State global untuk bot controller
+_bot_running     = False          # Apakah bot sedang berjalan
+_bot_stop_event  = None           # threading.Event untuk stop
+_bot_main_thread = None           # Thread utama bot
+_tg_offset       = 0              # Offset update Telegram polling
+_cmd_lock        = threading.Lock()
+
+# Timeframe yang dipilih user sebelum start (default semua)
+_selected_tfs: list = list(TIMEFRAMES)
+
+
+def _build_tf_keyboard(selected: list) -> dict:
+    """
+    Buat inline keyboard untuk pilih timeframe.
+    TF yang dipilih diberi centang ✅.
+    """
+    all_tfs = ['1h', '4h', '1d', '1w']
+    buttons_row = []
+    for tf in all_tfs:
+        mark = '✅' if tf in selected else '⬜'
+        buttons_row.append({
+            'text':          f"{mark} {tf.upper()}",
+            'callback_data': f"tf_toggle:{tf}",
+        })
+
+    return {
+        'inline_keyboard': [
+            buttons_row,
+            [
+                {'text': '🚀 START BOT',  'callback_data': 'cmd:start'},
+                {'text': '⬜ Reset TF',   'callback_data': 'cmd:reset_tf'},
+            ],
+        ]
+    }
+
+
+def _build_main_keyboard() -> dict:
+    """Keyboard utama saat bot sudah berjalan."""
+    return {
+        'inline_keyboard': [
+            [
+                {'text': '📊 Status',     'callback_data': 'cmd:status'},
+                {'text': '🛑 Stop Bot',   'callback_data': 'cmd:stop'},
+            ],
+            [
+                {'text': '❤️ Heartbeat', 'callback_data': 'cmd:heartbeat'},
+            ],
+        ]
+    }
+
+
+def _handle_command(chat_id: int, text: str, message_id: int = None):
+    """
+    Tangani perintah teks dari Telegram:
+    /start  → Tampilkan menu pilih TF + tombol START
+    /stop   → Hentikan bot
+    /status → Tampilkan status
+    /help   → Bantuan
+    """
+    global _bot_running, _selected_tfs
+
+    cmd = text.strip().lower().split()[0] if text else ''
+
+    if cmd in ('/start', 'start', '/menu', 'menu'):
+        with _cmd_lock:
+            if _bot_running:
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>Bot sudah berjalan!</b>\n"
+                    "Gunakan tombol di bawah untuk mengontrol bot.",
+                    reply_markup=_build_main_keyboard(),
+                )
+            else:
+                send_telegram_message(
+                    chat_id,
+                    "🤖 <b>BBMA Bot — Pilih Timeframe</b>\n"
+                    "──────────────────────\n"
+                    "Pilih timeframe yang ingin dipantau, lalu tekan <b>🚀 START BOT</b>.\n\n"
+                    "✅ = Aktif  |  ⬜ = Tidak aktif",
+                    reply_markup=_build_tf_keyboard(_selected_tfs),
+                )
+
+    elif cmd in ('/stop', 'stop'):
+        _do_stop_bot(chat_id)
+
+    elif cmd in ('/status', 'status'):
+        _do_status(chat_id)
+
+    elif cmd in ('/help', 'help'):
+        send_telegram_message(
+            chat_id,
+            "📖 <b>Daftar Perintah BBMA Bot</b>\n"
+            "──────────────────────\n"
+            "/start  — Menu utama (pilih TF & mulai bot)\n"
+            "/stop   — Hentikan bot\n"
+            "/status — Lihat status bot saat ini\n"
+            "/help   — Tampilkan bantuan ini\n"
+            "──────────────────────\n"
+            "<i>Ketik /start untuk mulai</i>",
+        )
+    else:
+        send_telegram_message(
+            chat_id,
+            "❓ Perintah tidak dikenal. Ketik /help untuk bantuan\n"
+            "atau /start untuk membuka menu.",
+        )
+
+
+def _handle_callback(callback_query: dict):
+    """
+    Tangani tombol inline yang ditekan user.
+    """
+    global _selected_tfs, _bot_running
+
+    cq_id   = callback_query['id']
+    chat_id = callback_query['message']['chat']['id']
+    msg_id  = callback_query['message']['message_id']
+    data    = callback_query.get('data', '')
+
+    # ── Open menu (sambutan) ──────────────────────────────────────
+    if data == 'cmd:open_menu':
+        answer_callback_query(cq_id, '📋 Membuka menu...')
+        with _cmd_lock:
+            running = _bot_running
+        if running:
+            send_telegram_message(
+                chat_id,
+                "⚠️ <b>Bot sudah berjalan!</b>",
+                reply_markup=_build_main_keyboard(),
+            )
+        else:
+            send_telegram_message(
+                chat_id,
+                "🤖 <b>BBMA Bot — Pilih Timeframe</b>\n"
+                "──────────────────────\n"
+                "Pilih timeframe yang ingin dipantau, lalu tekan <b>🚀 START BOT</b>.\n\n"
+                "✅ = Aktif  |  ⬜ = Tidak aktif",
+                reply_markup=_build_tf_keyboard(_selected_tfs),
+            )
+        return
+
+    # ── Help ──────────────────────────────────────────────────────
+    if data == 'cmd:help':
+        answer_callback_query(cq_id, '📖 Help')
+        send_telegram_message(
+            chat_id,
+            "📖 <b>Daftar Perintah BBMA Bot</b>\n"
+            "──────────────────────\n"
+            "/start  — Menu utama (pilih TF & mulai bot)\n"
+            "/stop   — Hentikan bot\n"
+            "/status — Lihat status bot saat ini\n"
+            "/help   — Tampilkan bantuan ini\n"
+            "──────────────────────\n"
+            "<i>Ketik /start untuk mulai</i>",
+        )
+        return
+
+    # ── Toggle timeframe ────────────────────────────────────────
+    if data.startswith('tf_toggle:'):
+        tf = data.split(':')[1]
+        with _cmd_lock:
+            if tf in _selected_tfs:
+                if len(_selected_tfs) > 1:   # minimal 1 TF harus dipilih
+                    _selected_tfs.remove(tf)
+                    answer_callback_query(cq_id, f"❌ {tf.upper()} dinonaktifkan")
+                else:
+                    answer_callback_query(cq_id, "⚠️ Minimal 1 timeframe harus aktif!")
+                    return
+            else:
+                _selected_tfs.append(tf)
+                # Urutkan sesuai urutan standar
+                order = ['1h', '4h', '1d', '1w']
+                _selected_tfs.sort(key=lambda x: order.index(x) if x in order else 99)
+                answer_callback_query(cq_id, f"✅ {tf.upper()} diaktifkan")
+
+        # Edit pesan untuk update tampilan keyboard
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup",
+                json={
+                    'chat_id':      chat_id,
+                    'message_id':   msg_id,
+                    'reply_markup': _build_tf_keyboard(_selected_tfs),
+                },
+                timeout=10,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Reset TF ke semua ────────────────────────────────────────
+    if data == 'cmd:reset_tf':
+        with _cmd_lock:
+            _selected_tfs = list(TIMEFRAMES)
+        answer_callback_query(cq_id, "🔄 Semua TF diaktifkan")
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup",
+                json={
+                    'chat_id':      chat_id,
+                    'message_id':   msg_id,
+                    'reply_markup': _build_tf_keyboard(_selected_tfs),
+                },
+                timeout=10,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Start Bot ─────────────────────────────────────────────────
+    if data == 'cmd:start':
+        answer_callback_query(cq_id, '🚀 Memulai bot...')
+        with _cmd_lock:
+            if _bot_running:
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ Bot sudah berjalan!\nGunakan /status untuk cek status.",
+                    reply_markup=_build_main_keyboard(),
+                )
+                return
+        _do_start_bot(chat_id)
+        return
+
+    # ── Stop Bot ─────────────────────────────────────────────────
+    if data == 'cmd:stop':
+        answer_callback_query(cq_id, '🛑 Menghentikan bot...')
+        _do_stop_bot(chat_id)
+        return
+
+    # ── Status ────────────────────────────────────────────────────
+    if data == 'cmd:status':
+        answer_callback_query(cq_id, '📊 Mengambil status...')
+        _do_status(chat_id)
+        return
+
+    # ── Heartbeat manual ─────────────────────────────────────────
+    if data == 'cmd:heartbeat':
+        answer_callback_query(cq_id, '❤️ Mengirim heartbeat...')
+        _do_manual_heartbeat(chat_id)
+        return
+
+
+def _do_start_bot(chat_id: int):
+    """
+    Mulai bot di thread terpisah dengan timeframe yang sudah dipilih.
+    """
+    global _bot_running, _bot_stop_event, _bot_main_thread, TIMEFRAMES
+
+    with _cmd_lock:
+        if _bot_running:
+            send_telegram_message(chat_id, "⚠️ Bot sudah aktif!")
+            return
+
+        # Terapkan timeframe yang dipilih secara global
+        TIMEFRAMES = list(_selected_tfs)
+        _bot_stop_event = threading.Event()
+        _bot_running    = True
+
+    tf_str = ' · '.join(tf.upper() for tf in TIMEFRAMES)
+    send_telegram_message(
+        chat_id,
+        f"🚀 <b>Bot sedang dinyalakan...</b>\n"
+        f"──────────────────────\n"
+        f"📊 Timeframe dipilih : <b>{tf_str}</b>\n"
+        f"⏳ Proses inisialisasi dimulai. Mohon tunggu beberapa menit.\n"
+        f"<i>Anda akan mendapat notifikasi saat bot LIVE.</i>",
+        reply_markup=_build_main_keyboard(),
+    )
+
+    # Jalankan main() di thread terpisah
+    _bot_main_thread = threading.Thread(
+        target=_run_bot_main,
+        args=(chat_id,),
+        name="BotMain",
+        daemon=True,
+    )
+    _bot_main_thread.start()
+
+
+def _run_bot_main(chat_id: int):
+    """Thread wrapper untuk menjalankan main() bot."""
+    global _bot_running, _bot_stop_event
+
+    try:
+        main_bot(_bot_stop_event)
+    except Exception as e:
+        print(f"  [BotMain Error] {e}")
+        send_telegram_message(
+            chat_id,
+            f"💀 <b>Bot berhenti karena error!</b>\n"
+            f"<code>{str(e)[:300]}</code>\n"
+            f"Gunakan /start untuk mencoba lagi.",
+        )
+    finally:
+        with _cmd_lock:
+            _bot_running = False
+        print("  [BotMain] Thread selesai.")
+
+
+def _do_stop_bot(chat_id: int):
+    """Hentikan bot yang sedang berjalan."""
+    global _bot_running, _bot_stop_event
+
+    with _cmd_lock:
+        if not _bot_running:
+            send_telegram_message(
+                chat_id,
+                "ℹ️ Bot tidak sedang berjalan.\nGunakan /start untuk memulai.",
+            )
+            return
+        _bot_running = False
+        if _bot_stop_event:
+            _bot_stop_event.set()
+
+    send_telegram_message(
+        chat_id,
+        "🛑 <b>Perintah STOP dikirim.</b>\n"
+        "Bot akan berhenti dalam beberapa detik...\n"
+        "Gunakan /start untuk menjalankan kembali.",
+    )
+
+
+def _do_status(chat_id: int):
+    """Kirim status bot saat ini ke chat."""
+    global _bot_running
+
+    with _proc_lock:
+        total_sigs = len(_processed_signals)
+
+    with _sym_lock:
+        sym_count = len(_shared_symbols)
+
+    if _bot_running:
+        tf_str = ' · '.join(tf.upper() for tf in TIMEFRAMES)
+        status_txt = (
+            f"📊 <b>Status BBMA Bot</b>\n"
+            f"──────────────────────\n"
+            f"🟢 Status      : <b>AKTIF / LIVE</b>\n"
+            f"📅 Timeframe   : {tf_str}\n"
+            f"💎 Simbol      : {sym_count} koin dipantau\n"
+            f"🧵 Threads     : {threading.active_count()} berjalan\n"
+            f"📊 Total sinyal: {total_sigs} tercatat\n"
+            f"⏰ Waktu cek   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        send_telegram_message(chat_id, status_txt, reply_markup=_build_main_keyboard())
+    else:
+        send_telegram_message(
+            chat_id,
+            f"📊 <b>Status BBMA Bot</b>\n"
+            f"──────────────────────\n"
+            f"🔴 Status : <b>TIDAK AKTIF</b>\n"
+            f"📊 Total sinyal tercatat sebelumnya: {total_sigs}\n"
+            f"──────────────────────\n"
+            f"Gunakan /start untuk menjalankan bot.",
+        )
+
+
+def _do_manual_heartbeat(chat_id: int):
+    """Kirim heartbeat status manual ke chat."""
+    global _bot_running
+
+    with _proc_lock:
+        total_sigs = len(_processed_signals)
+    with _sym_lock:
+        sym_count = len(_shared_symbols)
+
+    if _bot_running:
+        tf_str = ' · '.join(tf.upper() for tf in TIMEFRAMES)
+        img = generate_status_chart(label='HEARTBEAT')
+        send_telegram_message(
+            chat_id,
+            f"❤️ <b>Heartbeat Manual</b>\n"
+            f"──────────────────────\n"
+            f"🟢 Bot         : LIVE\n"
+            f"📅 Timeframe   : {tf_str}\n"
+            f"💎 Simbol      : {sym_count} koin\n"
+            f"🧵 Threads     : {threading.active_count()}\n"
+            f"📊 Sinyal      : {total_sigs} tercatat\n"
+            f"⏰ Waktu       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            reply_markup=_build_main_keyboard(),
+        )
+        if img:
+            try:
+                base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+                with open(img, 'rb') as photo:
+                    requests.post(
+                        f"{base}/sendPhoto",
+                        data={'chat_id': chat_id, 'caption': '📈 Chart terkini', 'parse_mode': 'HTML'},
+                        files={'photo': photo},
+                        timeout=20,
+                    )
+            except Exception:
+                pass
+    else:
+        send_telegram_message(
+            chat_id,
+            "🔴 <b>Bot tidak aktif.</b>\nGunakan /start untuk memulai.",
+        )
+
+
+def telegram_command_listener(stop_event: threading.Event):
+    """
+    Long-polling Telegram updates untuk menerima perintah dari user.
+    Berjalan terus sampai stop_event di-set.
+    """
+    global _tg_offset
+
+    _info("Telegram Command Listener aktif — siap terima perintah")
+    base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+    while not stop_event.is_set():
+        try:
+            r = requests.get(
+                f"{base}/getUpdates",
+                params={
+                    'offset':          _tg_offset,
+                    'timeout':         20,
+                    'allowed_updates': json.dumps(['message', 'callback_query']),
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                time.sleep(3)
+                continue
+
+            data = r.json()
+            if not data.get('ok'):
+                time.sleep(3)
+                continue
+
+            for update in data.get('result', []):
+                _tg_offset = update['update_id'] + 1
+
+                # ── Pesan teks (perintah) ──────────────────────────
+                if 'message' in update:
+                    msg     = update['message']
+                    chat_id = msg['chat']['id']
+                    text    = msg.get('text', '')
+                    if text:
+                        threading.Thread(
+                            target=_handle_command,
+                            args=(chat_id, text, msg.get('message_id')),
+                            daemon=True,
+                        ).start()
+
+                # ── Callback dari tombol inline ────────────────────
+                elif 'callback_query' in update:
+                    threading.Thread(
+                        target=_handle_callback,
+                        args=(update['callback_query'],),
+                        daemon=True,
+                    ).start()
+
+        except requests.exceptions.Timeout:
+            pass
+        except Exception as e:
+            print(f"  [TG Listener Error] {e}")
+            time.sleep(5)
+
+
 # ==========================================
 # 15. SIGNAL PROCESSOR — dipanggil saat candle close via WS
 # ==========================================
@@ -2051,363 +2542,13 @@ def heartbeat_daemon(start_time: datetime, ws_pairs: list,
         _info(f"Heartbeat Telegram terkirim — uptime {uptime_str}")
 
 # ==========================================
-# 19. TELEGRAM COMMAND HANDLER
+# 19. MAIN
 # ==========================================
-"""
-Perintah yang didukung via Telegram:
-  /start     — Tampilkan menu perintah
-  /status    — Tampilkan status bot saat ini
-  /settf     — Tampilkan menu pilihan timeframe
-  /settf 1h 4h 1d   — Set TF langsung (kombinasi bebas)
-  /tfall     — Aktifkan semua TF (1h 4h 1d 1w)
-  /stop      — Hentikan bot (butuh konfirmasi)
-  /stopyes   — Konfirmasi hentikan bot
-  /help      — Tampilkan daftar perintah
-"""
-
-_tg_stop_confirm  = False   # flag konfirmasi /stop
-_tg_stop_flag     = threading.Event()   # sinyal ke main untuk stop bot
-_tg_cmd_offset    = 0       # last_update_id untuk getUpdates long-polling
-
-_VALID_TF = {'1h', '4h', '8h', '12h', '1d', '1w'}
-
-
-def _tg_get_updates(offset: int = 0, timeout: int = 20) -> list:
-    """Long-poll getUpdates dari Telegram."""
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params={'offset': offset, 'timeout': timeout, 'allowed_updates': ['message']},
-            timeout=timeout + 5,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get('ok'):
-                return data.get('result', [])
-    except Exception as e:
-        print(f"  [TG CMD] getUpdates error: {e}")
-    return []
-
-
-def _tg_reply(chat_id, text: str):
-    """Kirim pesan balasan ke Telegram."""
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                'chat_id':                  chat_id,
-                'text':                     text,
-                'parse_mode':               'HTML',
-                'disable_web_page_preview': True,
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"  [TG CMD] reply error: {e}")
-
-
-def _cmd_status(chat_id, start_time: datetime, ws_pairs: list, symbols: list):
-    """Handler /status — tampilkan info bot."""
-    now        = datetime.now()
-    uptime_sec = int((now - start_time).total_seconds())
-    uptime_str = (
-        f"{uptime_sec // 3600}j "
-        f"{(uptime_sec % 3600) // 60}m "
-        f"{uptime_sec % 60}d"
-    )
-    with _proc_lock:
-        total_sigs = len(_processed_signals)
-    with _tf_lock:
-        active_tf = list(TIMEFRAMES)
-
-    text = (
-        f"✅ <b>BBMA Bot — STATUS</b>\n"
-        f"──────────────────────\n"
-        f"🟢 Status      : Bot berjalan normal\n"
-        f"⏱ Uptime       : <b>{uptime_str}</b>\n"
-        f"🕐 Waktu       : {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"──────────────────────\n"
-        f"💎 Simbol      : {len(symbols)} koin (Top-{TOP_N} by OI)\n"
-        f"📊 TF aktif    : <b>{' · '.join(tf.upper() for tf in active_tf)}</b>\n"
-        f"📡 WebSocket   : {len(ws_pairs)} koneksi\n"
-        f"🧵 Threads     : {threading.active_count()} aktif\n"
-        f"📈 Total sinyal: {total_sigs} sinyal tercatat\n"
-        f"──────────────────────\n"
-        f"Ketik /help untuk daftar perintah."
-    )
-    _tg_reply(chat_id, text)
-
-
-def _cmd_settf(chat_id, args: list):
+def main_bot(external_stop_event: threading.Event = None):
     """
-    Handler /settf — ubah timeframe aktif.
-    Tanpa argumen → tampilkan menu pilihan.
-    Dengan argumen (mis. /settf 1h 4h) → set TF langsung.
+    Fungsi utama bot — sekarang bisa dipanggil dari thread
+    dan dihentikan via external_stop_event (dari Telegram command).
     """
-    global TIMEFRAMES
-
-    if not args:
-        # Tampilkan panduan pilihan TF
-        with _tf_lock:
-            current = list(TIMEFRAMES)
-        text = (
-            f"⚙️ <b>Pilih Timeframe Aktif</b>\n"
-            f"──────────────────────\n"
-            f"TF saat ini : <b>{' · '.join(tf.upper() for tf in current)}</b>\n"
-            f"\n"
-            f"📝 <b>Cara pilih TF:</b>\n"
-            f"Ketik perintah dengan kombinasi TF yang kamu mau:\n\n"
-            f"  /settf 1h\n"
-            f"  /settf 4h 8h\n"
-            f"  /settf 1h 4h 8h 12h\n"
-            f"  /settf 1h 4h 8h 12h 1d 1w\n\n"
-            f"Atau gunakan shortcut:\n"
-            f"  /tfall  → aktifkan semua TF\n\n"
-            f"TF yang tersedia: <b>1h · 4h · 8h · 12h · 1d · 1w</b>"
-        )
-        _tg_reply(chat_id, text)
-        return
-
-    # Validasi argumen
-    requested = [a.lower() for a in args]
-    invalid   = [tf for tf in requested if tf not in _VALID_TF]
-    if invalid:
-        _tg_reply(
-            chat_id,
-            f"❌ <b>TF tidak valid: {', '.join(invalid)}</b>\n"
-            f"TF yang tersedia: 1h · 4h · 8h · 12h · 1d · 1w\n"
-            f"Contoh: /settf 1h 4h 8h"
-        )
-        return
-
-    valid = [tf for tf in ['1h', '4h', '8h', '12h', '1d', '1w'] if tf in requested]   # urutan tetap
-
-    with _tf_lock:
-        old_tf    = list(TIMEFRAMES)
-        TIMEFRAMES.clear()
-        TIMEFRAMES.extend(valid)
-        new_tf    = list(TIMEFRAMES)
-
-    msg = (
-        f"✅ <b>Timeframe berhasil diubah!</b>\n"
-        f"──────────────────────\n"
-        f"TF sebelum : {' · '.join(tf.upper() for tf in old_tf)}\n"
-        f"TF sekarang: <b>{' · '.join(tf.upper() for tf in new_tf)}</b>\n"
-        f"──────────────────────\n"
-        f"ℹ️  Perubahan berlaku untuk scan berikutnya.\n"
-        f"WebSocket masih berjalan di semua TF lama;\n"
-        f"hanya <b>notifikasi sinyal</b> yang difilter ke TF baru."
-    )
-    _tg_reply(chat_id, msg)
-    print(f"  {C.CYAN}[TG CMD] TF diubah: {old_tf} → {new_tf}{C.RESET}")
-
-    send_telegram_photo(
-        f"⚙️ <b>Timeframe diperbarui via Telegram</b>\n"
-        f"──────────────────────\n"
-        f"TF aktif baru: <b>{' · '.join(tf.upper() for tf in new_tf)}</b>\n"
-        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-
-def _cmd_stop(chat_id):
-    """Handler /stop — minta konfirmasi sebelum hentikan bot."""
-    global _tg_stop_confirm
-    _tg_stop_confirm = True
-    _tg_reply(
-        chat_id,
-        f"⚠️ <b>Konfirmasi Hentikan Bot</b>\n"
-        f"──────────────────────\n"
-        f"Kamu yakin ingin MENGHENTIKAN bot?\n\n"
-        f"✅ Ketik /stopyes untuk konfirmasi\n"
-        f"❌ Ketik /cancel untuk batalkan\n\n"
-        f"<i>Bot akan berhenti memantau sinyal setelah dikonfirmasi.</i>"
-    )
-
-
-def _cmd_stopyes(chat_id):
-    """Handler /stopyes — konfirmasi stop bot."""
-    global _tg_stop_confirm
-    if not _tg_stop_confirm:
-        _tg_reply(chat_id, "ℹ️ Tidak ada permintaan stop yang menunggu konfirmasi.\nKetik /stop terlebih dahulu.")
-        return
-    _tg_stop_confirm = False
-    _tg_reply(
-        chat_id,
-        f"🔴 <b>Bot akan dihentikan...</b>\n"
-        f"──────────────────────\n"
-        f"✅ Konfirmasi diterima\n"
-        f"⏳ Menghentikan semua thread & koneksi...\n"
-        f"📨 Laporan akhir akan dikirim sesaat lagi."
-    )
-    print(f"  {C.RED}[TG CMD] Stop dikonfirmasi via Telegram!{C.RESET}")
-    _tg_stop_flag.set()
-
-
-def _cmd_cancel(chat_id):
-    global _tg_stop_confirm
-    _tg_stop_confirm = False
-    _tg_reply(chat_id, "✅ Batalkan. Bot tetap berjalan.")
-
-
-def _cmd_help(chat_id):
-    """Handler /help — tampilkan daftar perintah."""
-    with _tf_lock:
-        active_tf = list(TIMEFRAMES)
-    text = (
-        f"📋 <b>Daftar Perintah BBMA Bot</b>\n"
-        f"══════════════════════\n"
-        f"🟢 /start   — Tampilkan menu utama\n"
-        f"📊 /status  — Status bot saat ini\n"
-        f"──────────────────────\n"
-        f"⚙️ <b>Timeframe:</b>\n"
-        f"  /settf          — Panduan ubah TF\n"
-        f"  /settf 1h       — Aktifkan hanya 1H\n"
-        f"  /settf 4h 8h    — Aktifkan 4H + 8H\n"
-        f"  /settf 8h 12h   — Aktifkan 8H + 12H\n"
-        f"  /settf 1h 4h 8h 12h 1d — Aktifkan 5 TF\n"
-        f"  /tfall          — Aktifkan semua TF\n"
-        f"──────────────────────\n"
-        f"🔴 <b>Kontrol Bot:</b>\n"
-        f"  /stop        — Minta hentikan bot\n"
-        f"  /stopyes     — Konfirmasi hentikan\n"
-        f"  /cancel      — Batalkan stop\n"
-        f"══════════════════════\n"
-        f"TF aktif sekarang: <b>{' · '.join(tf.upper() for tf in active_tf)}</b>\n"
-        f"TF tersedia: 1h · 4h · 8h · 12h · 1d · 1w"
-    )
-    _tg_reply(chat_id, text)
-
-
-def _cmd_start(chat_id):
-    """Handler /start — menu utama."""
-    with _tf_lock:
-        active_tf = list(TIMEFRAMES)
-    text = (
-        f"🚀 <b>BBMA Bot — Telegram Control</b>\n"
-        f"══════════════════════\n"
-        f"Selamat datang! Bot sedang aktif memantau sinyal.\n\n"
-        f"📊 TF aktif: <b>{' · '.join(tf.upper() for tf in active_tf)}</b>\n\n"
-        f"<b>Perintah cepat:</b>\n"
-        f"  📈 /status   — Lihat status bot\n"
-        f"  ⚙️ /settf    — Ubah timeframe\n"
-        f"  🔴 /stop     — Hentikan bot\n"
-        f"  ❓ /help     — Semua perintah\n"
-        f"══════════════════════\n"
-        f"<i>Ketik perintah di atas untuk mulai.</i>"
-    )
-    _tg_reply(chat_id, text)
-
-
-def telegram_command_daemon(
-    stop_event: threading.Event,
-    start_time: datetime,
-    ws_pairs_ref: list,
-    symbols_ref: list,
-):
-    """
-    Daemon thread yang terus-menerus polling Telegram getUpdates
-    dan menjalankan perintah dari operator.
-    """
-    global _tg_cmd_offset, TIMEFRAMES
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        _warn("Telegram token/chat_id kosong — Command Handler tidak aktif.")
-        return
-
-    _info("Telegram Command Handler aktif. Ketik /help di Telegram untuk daftar perintah.")
-    send_telegram_photo(
-        f"🎮 <b>Telegram Control AKTIF</b>\n"
-        f"──────────────────────\n"
-        f"Kamu sekarang bisa kontrol bot via pesan Telegram!\n\n"
-        f"📋 Ketik /help untuk melihat semua perintah\n"
-        f"⚙️ Ketik /settf untuk memilih timeframe\n"
-        f"🔴 Ketik /stop untuk menghentikan bot\n"
-        f"──────────────────────\n"
-        f"<i>Hanya pesan dari chat_id terdaftar yang diproses.</i>"
-    )
-
-    ALLOWED_CHAT = str(TELEGRAM_CHAT_ID)
-
-    while not stop_event.is_set() and not _tg_stop_flag.is_set():
-        updates = _tg_get_updates(offset=_tg_cmd_offset, timeout=15)
-
-        for update in updates:
-            _tg_cmd_offset = update['update_id'] + 1
-
-            msg = update.get('message', {})
-            if not msg:
-                continue
-
-            # Security: hanya terima dari chat_id yang terdaftar
-            chat_id  = str(msg.get('chat', {}).get('id', ''))
-            if chat_id != ALLOWED_CHAT:
-                _tg_reply(
-                    chat_id,
-                    "⛔ Akses ditolak. Chat ID tidak terdaftar."
-                )
-                print(f"  {C.RED}[TG CMD] Perintah ditolak dari chat_id: {chat_id}{C.RESET}")
-                continue
-
-            text = msg.get('text', '').strip()
-            if not text or not text.startswith('/'):
-                continue
-
-            parts   = text.split()
-            command = parts[0].lower().split('@')[0]   # hapus @botname jika ada
-            args    = parts[1:]
-
-            print(f"  {C.CYAN}[TG CMD] Perintah diterima: {text}{C.RESET}")
-
-            if command == '/start':
-                _cmd_start(chat_id)
-
-            elif command == '/help':
-                _cmd_help(chat_id)
-
-            elif command == '/status':
-                _cmd_status(chat_id, start_time, ws_pairs_ref, symbols_ref)
-
-            elif command == '/settf':
-                _cmd_settf(chat_id, args)
-
-            elif command == '/tfall':
-                _cmd_settf(chat_id, list(_ALL_TIMEFRAMES))
-
-            elif command == '/stop':
-                _cmd_stop(chat_id)
-
-            elif command == '/stopyes':
-                _cmd_stopyes(chat_id)
-                if _tg_stop_flag.is_set():
-                    stop_event.set()   # trigger stop loop utama
-                    return
-
-            elif command == '/cancel':
-                _cmd_cancel(chat_id)
-
-            else:
-                _tg_reply(
-                    chat_id,
-                    f"❓ Perintah tidak dikenal: <code>{command}</code>\n"
-                    f"Ketik /help untuk daftar perintah."
-                )
-
-        # Cek apakah stop_flag sudah di-set dari thread lain
-        if _tg_stop_flag.is_set():
-            stop_event.set()
-            return
-
-        # Jeda singkat sebelum poll berikutnya
-        for _ in range(3):
-            if stop_event.is_set() or _tg_stop_flag.is_set():
-                return
-            time.sleep(1)
-
-
-# ==========================================
-# 20. MAIN
-# ==========================================
-def main():
     global _processed_signals
 
     _start_time = datetime.now()
@@ -2497,7 +2638,8 @@ def main():
 
     scan_missed_signals(symbols)
 
-    stop_event  = threading.Event()
+    # Gunakan external_stop_event jika diberikan (dari Telegram /stop command)
+    stop_event  = external_stop_event if external_stop_event is not None else threading.Event()
     all_threads = []
 
     # ── FIX-1: Signal queue processor thread (satu thread, serial) ─
@@ -2546,16 +2688,6 @@ def main():
     t_hb.start()
     all_threads.append(t_hb)
 
-    # ── Telegram Command Handler daemon ──────────────────────────
-    # Menerima perintah dari Telegram: /settf, /stop, /status, dll.
-    t_cmd = threading.Thread(
-        target=telegram_command_daemon,
-        args=(stop_event, _start_time, ws_pairs, symbols),
-        name="TgCmd", daemon=True
-    )
-    t_cmd.start()
-    all_threads.append(t_cmd)
-
     _live_time   = datetime.now()
     _total_init  = (_live_time - _start_time).seconds
 
@@ -2600,17 +2732,26 @@ def main():
 
 
     try:
-        while not stop_event.is_set() and not _tg_stop_flag.is_set():
-            time.sleep(10)
-        
-        # Jika dihentikan via Telegram (bukan Ctrl+C)
-        if _tg_stop_flag.is_set() and not stop_event.is_set():
-            raise KeyboardInterrupt   # gunakan blok shutdown yang sama
+        # Gunakan external_stop_event jika diberikan (dijalankan dari Telegram command)
+        # Jika tidak, buat sendiri (dijalankan langsung dari terminal)
+        if external_stop_event is not None:
+            # Mode: dikontrol dari Telegram command handler
+            while not external_stop_event.is_set():
+                time.sleep(1)
+            # stop_event sudah di-set oleh command handler
+        else:
+            # Mode: standalone (langsung dari terminal, Ctrl+C untuk stop)
+            while True:
+                time.sleep(10)
+
     except KeyboardInterrupt:
         print()
         print(_sep('─'))
-        stop_source = "Telegram (/stopyes)" if _tg_stop_flag.is_set() else "Ctrl+C"
-        _warn(f"Menghentikan bot ({stop_source})...")
+        _warn("Menghentikan bot (Ctrl+C)...")
+        stop_event.set()
+
+    finally:
+        # Hentikan semua koneksi WS dan thread
         stop_event.set()
         for _, conn in ws_pairs:
             conn.stop()
@@ -2629,44 +2770,101 @@ def main():
         )
         with _proc_lock:
             _total_sigs = len(_processed_signals)
+
+        _alasan = "Telegram Command /stop" if external_stop_event else "Ctrl+C"
         _chart_stop = generate_status_chart(label='BOT_STOP')
         send_telegram_photo(
-            f"🔴 <b>BBMA Bot DIHENTIKAN ({stop_source})</b>\n"
+            f"🔴 <b>BBMA Bot DIHENTIKAN</b>\n"
             f"══════════════════════\n"
-            f"⛔ Alasan      : Dihentikan oleh operator ({stop_source})\n"
+            f"⛔ Alasan      : {_alasan}\n"
             f"⏰ Mulai       : {_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🛑 Berhenti    : {_stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"⏱ Uptime       : {_uptime_str}\n"
             f"📊 Total sinyal: {_total_sigs} sinyal tercatat\n"
             f"──────────────────────\n"
-            f"ℹ️  <i>Jalankan ulang bot untuk melanjutkan pemantauan.</i>",
+            f"ℹ️  <i>Gunakan /start untuk menjalankan kembali.</i>",
             image_path=_chart_stop,
         )
         _ok("Bot berhenti.")
         print()
-    except Exception as _fatal_err:
-        _stop_time  = datetime.now()
-        _uptime_sec = int((_stop_time - _start_time).total_seconds())
-        _uptime_str = (
-            f"{_uptime_sec // 3600}j "
-            f"{(_uptime_sec % 3600) // 60}m "
-            f"{_uptime_sec % 60}d"
-        )
-        stop_event.set()
-        _chart_crash = generate_status_chart(label='BOT_CRASH')
-        send_telegram_photo(
-            f"💀 <b>BBMA Bot CRASH — ERROR TAK TERDUGA!</b>\n"
-            f"══════════════════════\n"
-            f"🚨 Error   : <code>{str(_fatal_err)[:300]}</code>\n"
-            f"⏰ Mulai   : {_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"💥 Crash   : {_stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"⏱ Uptime  : {_uptime_str}\n"
-            f"──────────────────────\n"
-            f"⚠️  <b>Bot mati mendadak! Perlu dinyalakan ulang secara manual.</b>",
-            image_path=_chart_crash,
-        )
-        raise
 
 
 if __name__ == "__main__":
-    main()
+    # ── Entry point utama ─────────────────────────────────────────
+    # 1. Jalankan Telegram Command Listener terlebih dahulu
+    # 2. Listener menunggu perintah /start dari user di Telegram
+    # 3. Saat /start diterima, bot akan mulai dengan TF yang dipilih
+    # 4. /stop menghentikan bot (listener tetap jalan)
+    # 5. Ctrl+C menghentikan semuanya
+
+    print()
+    print('═' * 68)
+    print(f"  🤖  BBMA Bot — Telegram Command Mode")
+    print('─' * 68)
+    print(f"  Token  : {TELEGRAM_TOKEN[:20]}...")
+    print(f"  Chat   : {TELEGRAM_CHAT_ID}")
+    print(f"  ─────────────────────────────────────")
+    print(f"  Kirim /start ke bot Telegram Anda untuk memulai.")
+    print(f"  Kirim /stop  untuk menghentikan bot.")
+    print(f"  Kirim /help  untuk melihat semua perintah.")
+    print(f"  Ctrl+C untuk keluar dari program ini.")
+    print('═' * 68)
+    print()
+
+    _listener_stop = threading.Event()
+
+    # Kirim pesan selamat datang ke Telegram
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                'chat_id':      TELEGRAM_CHAT_ID,
+                'text':         (
+                    "🤖 <b>BBMA Bot siap menerima perintah!</b>\n"
+                    "──────────────────────\n"
+                    "Gunakan perintah berikut:\n"
+                    "/start  — Pilih timeframe & mulai bot\n"
+                    "/stop   — Hentikan bot\n"
+                    "/status — Status bot\n"
+                    "/help   — Bantuan\n"
+                    "──────────────────────\n"
+                    "<i>Tekan /start untuk membuka menu pemilihan timeframe.</i>"
+                ),
+                'parse_mode':   'HTML',
+                'reply_markup': json.dumps({
+                    'inline_keyboard': [[
+                        {'text': '🚀 Mulai Bot',  'callback_data': 'cmd:open_menu'},
+                        {'text': '📖 Help',        'callback_data': 'cmd:help'},
+                    ]]
+                }),
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"  ⚠️  Gagal kirim pesan sambutan: {e}")
+
+    # Jalankan Telegram listener di thread terpisah
+    t_listener = threading.Thread(
+        target=telegram_command_listener,
+        args=(_listener_stop,),
+        name="TGListener",
+        daemon=False,   # Bukan daemon — tetap jalan meski thread lain mati
+    )
+    t_listener.start()
+
+    try:
+        t_listener.join()
+    except KeyboardInterrupt:
+        print()
+        print("  ⚠️  Keluar dari program (Ctrl+C)...")
+        _listener_stop.set()
+
+        # Stop bot jika sedang berjalan
+        with _cmd_lock:
+            if _bot_running and _bot_stop_event:
+                _bot_stop_event.set()
+
+        t_listener.join(timeout=5)
+        print("  ✅ Program selesai.")
+        print()
+
